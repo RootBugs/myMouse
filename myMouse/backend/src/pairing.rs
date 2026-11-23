@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 const CODE_TTL: Duration = Duration::from_secs(300);
 
 pub fn generate_code() -> String {
-    let value: u32 = rand::thread_rng().gen_range(0..1_000_000);
+    let value: u32 = rand::rng().random_range(0..1_000_000);
     format!("{value:06}")
 }
 

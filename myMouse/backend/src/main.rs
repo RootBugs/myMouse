@@ -1,6 +1,7 @@
 mod discovery;
 mod pairing;
 mod trust;
+mod transport;
 
 fn main() {
     println!("mymouse-backend");
