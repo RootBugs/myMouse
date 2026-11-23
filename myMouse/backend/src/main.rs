@@ -1,4 +1,5 @@
 mod discovery;
+mod layout;
 mod pairing;
 mod trust;
 mod transport;
