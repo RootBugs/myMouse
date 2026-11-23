@@ -10,7 +10,40 @@
     "build": "tsc --noEmit && vite build && npm run build:electron",
     "test": "vitest",
     "smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-two-instances.ps1",
-    "dist": "npm run build && electron-builder --win nsis"
+    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File installer/build-windows.ps1"
+  },
+  "build": {
+    "appId": "com.mymouse.desktop",
+    "productName": "myMouse",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/target/release/mymouse-backend.exe",
+        "to": "mymouse-backend.exe"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.6.3",

@@ -7,7 +7,9 @@ let backend: ChildProcess | null = null;
 let bridge: Bridge | null = null;
 
 function startBackend(): void {
-  const exe = path.join(__dirname, '..', 'backend', 'target', 'debug', 'mymouse-backend.exe');
+  const exe = app.isPackaged
+    ? path.join(process.resourcesPath, 'mymouse-backend.exe')
+    : path.join(__dirname, '..', 'backend', 'target', 'debug', 'mymouse-backend.exe');
   backend = spawn(exe, ['--ipc', 'stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
   bridge = new Bridge(backend as unknown as ConstructorParameters<typeof Bridge>[0]);
 
@@ -27,7 +29,7 @@ function createWindow(): void {
     },
   });
 
-  window.loadFile(path.join(__dirname, '..', 'index.html'));
+  window.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
 }
 
 app.whenReady().then(() => {
