@@ -2,10 +2,20 @@ mod discovery;
 mod input;
 mod layout;
 mod pairing;
+mod test_mode;
 mod trust;
 mod transport;
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(config) = test_mode::parse_args(&args) {
+        if let Err(error) = test_mode::run(config).await {
+            eprintln!("mymouse test mode failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     println!("mymouse-backend");
 }
 

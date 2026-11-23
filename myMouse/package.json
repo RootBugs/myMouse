@@ -9,6 +9,7 @@
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "tsc --noEmit && vite build && npm run build:electron",
     "test": "vitest",
+    "smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-two-instances.ps1",
     "dist": "npm run build && electron-builder --win nsis"
   },
   "devDependencies": {

@@ -91,7 +91,7 @@ impl ServerCertVerifier for PinnedVerifier {
 pub struct Server {
     local_addr: SocketAddr,
     _task: JoinHandle<()>,
-    _accepted: mpsc::Receiver<PeerStream>,
+    accepted: tokio::sync::Mutex<mpsc::Receiver<PeerStream>>,
 }
 
 impl Server {
@@ -125,12 +125,22 @@ impl Server {
         Ok(Self {
             local_addr,
             _task: task,
-            _accepted: accepted,
+            accepted: tokio::sync::Mutex::new(accepted),
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Wait for the next pinned-TLS peer connection.
+    pub async fn accept(&self) -> TransportResult<PeerStream> {
+        self.accepted
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| "transport server stopped".into())
     }
 }
 
