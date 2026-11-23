@@ -1,0 +1,7 @@
+# Local dev toolchain: MSVC linker is unavailable on this host, so the
+# Windows GNU target is used with the WinLibs MinGW toolchain installed by winget.
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/hp/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.MCF.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/x86_64-w64-mingw32-gcc.exe"
