@@ -1,3 +1,5 @@
+mod discovery;
+
 fn main() {
     println!("mymouse-backend");
 }
