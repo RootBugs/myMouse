@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="24dp">
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/settings" android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchInput" android:layout_width="match_parent" android:layout_height="wrap_content" android:checked="true" android:text="Allow input injection (requires Accessibility)" />
+        <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchClipboard" android:layout_width="match_parent" android:layout_height="wrap_content" android:checked="true" android:text="Allow clipboard sync (future)" />
+        <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchFiles" android:layout_width="match_parent" android:layout_height="wrap_content" android:checked="true" android:text="Allow file transfers" />
+        <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchScreen" android:layout_width="match_parent" android:layout_height="wrap_content" android:checked="true" android:text="Allow remote screen viewing" />
+        <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchRequireApproval" android:layout_width="match_parent" android:layout_height="wrap_content" android:checked="true" android:text="Require approval per file transfer" />
+
+        <Button android:id="@+id/btnOpenAccessibility" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Open Accessibility settings" />
+        <Button android:id="@+id/btnOpenNotifications" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open notification listener settings" />
+
+        <TextView android:id="@+id/settingsStatus" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Settings are stored locally on device. No cloud sync." />
+    </LinearLayout>
+</ScrollView>

@@ -10,6 +10,17 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getSettings: async () => ({
+        ok: true,
+        settings: {
+          clipboard: { enabled: true, mode: 'global' },
+          file_transfer: { auto_accept: false, save_dir: '', max_transfer_bytes: 100 * 1024 * 1024 },
+          auto_reconnect: true,
+          launch_at_start: false,
+          quick_drop_enabled: true,
+        },
+      }),
+      listTransfers: async () => ({ ok: true, transfers: [] }),
     };
 
     render(<App />);

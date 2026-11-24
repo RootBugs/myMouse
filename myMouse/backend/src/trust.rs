@@ -81,6 +81,13 @@ impl TrustStore {
         self.devices.get(&sanitize_id(id)).map(|d| &d.capabilities)
     }
 
+    pub fn capabilities_map(&self) -> Vec<(String, Capabilities)> {
+        self.devices
+            .iter()
+            .map(|(id, device)| (id.clone(), device.capabilities.clone()))
+            .collect()
+    }
+
     pub fn set_fingerprint(&mut self, id: &str, fingerprint: String) {
         if let Some(device) = self.devices.get_mut(&sanitize_id(id)) {
             device.fingerprint = Some(fingerprint);

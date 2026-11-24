@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">myMouse</string>
+    <string name="accessibility_service_description">myMouse uses Accessibility to inject mouse, keyboard, and gesture input from a trusted paired computer. Enable only for devices you trust. myMouse does not read screen content for input injection.</string>
+    <string name="notification_listener_label">myMouse notification helper</string>
+    <string name="pairing_title">Pairing</string>
+    <string name="scan_qr">Scan QR code</string>
+    <string name="enter_code">Enter 6-digit code</string>
+    <string name="approve_pairing">Approve pairing</string>
+    <string name="trusted_devices">Trusted devices</string>
+    <string name="file_transfer">File transfer</string>
+    <string name="remote_screen">Remote screen</string>
+    <string name="settings">Settings</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_scaffold">Phase 3 scaffold - Android SDK/device verification required</string>
+</resources>

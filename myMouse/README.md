@@ -4,12 +4,16 @@ myMouse is a local-first software KVM app: share one keyboard and mouse across
 nearby computers, with its own protocol, trust store, and interface. It is a
 from-scratch alternative, not a wrapper around any installed application.
 
-**Current scope: Phase 1 — Windows host ↔ Windows target (implemented).**
-Phase 4 adds an **Apple Silicon Mac target/helper scaffold** under
-`apps/mac/` (Swift package/app skeleton, docs, packaging notes); it has not
-been built or runtime-verified on this Windows host. Android, clipboard sync,
-file drop, and remote screen remain planned/incomplete. Builds are **unsigned**
-until a code-signing certificate is provided.
+**Runtime-verified scope: Phase 1 - Windows host to Windows target only.**
+Phase 2 adds clipboard/file-transfer protocol messages, backend state managers,
+IPC commands, and UI panels. The peer-to-peer delivery loop is not wired yet,
+so no clipboard or file data moves between machines. Phase 3 adds an Android
+app scaffold under `apps/android/` (UI, accessibility service, stub bridge) and
+a Rust FFI bridge crate under `shared/android-bridge/`. No Android SDK/NDK is
+installed here, so no APK was built or device-tested. Phase 4 adds an Apple
+Silicon Mac target/helper scaffold under `apps/mac/`; it has not been built or
+runtime-verified on this Windows host. Remote screen remains unimplemented.
+Builds are **unsigned** until a code-signing certificate is provided.
 
 ## What is included
 
@@ -104,19 +108,23 @@ its capabilities. Revoking removes the pin, so the peer must pair again.
 See [docs/limitations.md](docs/limitations.md). In short:
 
 - No injection into UAC prompts, the secure desktop, or locked sessions.
-- Clipboard sync, file transfer, and remote screen are not in Phase 1.
+- Clipboard/file-transfer state and UI exist, but peer-to-peer delivery is not
+  wired yet; remote screen is not implemented.
 - Complex keyboard layouts, IMEs, and per-monitor DPI handoff are not complete.
-- Android/Mac targets cannot be verified on a Windows host.
+- The Android app uses a stub bridge and cannot be built or tested here (no
+  Android SDK/NDK); Mac targets cannot be verified on a Windows host.
 - Builds are unsigned; autostart is off until you enable it.
 
 ## Development layout
 
 ```
 myMouse/
+  apps/android/     Phase 3 Android app scaffold (Kotlin, stub bridge)
   apps/mac/         Phase 4 Apple Silicon Mac target/helper scaffold (Swift)
   electron/         Electron main, preload, JSON-RPC bridge
   src/              React UI
   shared/protocol/  Versioned binary message protocol
+  shared/android-bridge/  Rust FFI bridge scaffold for Android
   backend/          Rust/Tokio backend (discovery, pairing, TLS, layout, input)
   scripts/          Two-instance smoke test
   installer/        Windows build and artifact verification

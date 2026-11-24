@@ -70,3 +70,18 @@ h2 { font-size: 16px; margin-top: 28px; }
 input, select, button { font: inherit; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a4050; }
 button { background: #3a6ff0; color: white; border: 0; cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.drop-zone {
+  margin: 16px 0;
+  padding: 24px;
+  max-width: 640px;
+  border: 1px dashed #4a91ff;
+  border-radius: 8px;
+  background: #1c1f26;
+}
+.drop-zone.dragging { background: #243047; }
+.transfer-row { justify-content: space-between; align-items: flex-start; }
+.transfer-main { display: flex; flex-direction: column; gap: 2px; }
+.transfer-actions { display: flex; gap: 8px; }
+label { display: block; margin: 10px 0; }
+label input, label select { margin-left: 8px; }

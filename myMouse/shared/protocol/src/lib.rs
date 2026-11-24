@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const PROTOCOL_HEADER_LEN: usize = 2;
-const MAX_BODY_LEN: usize = 1024 * 1024;
+const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
+
+pub type DeviceId = String;
+pub type TransferId = String;
 
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
@@ -20,7 +23,7 @@ impl fmt::Display for ProtocolError {
         let text = match self {
             ProtocolError::TooShort => "message shorter than protocol header",
             ProtocolError::VersionMismatch => "unsupported protocol version",
-            ProtocolError::TooLarge => "message body exceeds 1 MiB",
+            ProtocolError::TooLarge => "message body exceeds 16 MiB",
             ProtocolError::InvalidPayload => "invalid message payload",
         };
         f.write_str(text)
@@ -28,6 +31,65 @@ impl fmt::Display for ProtocolError {
 }
 
 impl std::error::Error for ProtocolError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardKind {
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardPayload {
+    pub device_id: DeviceId,
+    pub kind: ClipboardKind,
+    /// UTF-8 text for text clipboard updates.
+    pub text: Option<String>,
+    /// Base64-encoded image bytes (PNG) for image clipboard updates.
+    pub data_base64: Option<String>,
+    /// MIME type, e.g. "image/png".
+    pub mime: Option<String>,
+    /// Milliseconds since UNIX epoch; used for last-write-wins.
+    pub timestamp_ms: u64,
+    /// Monotonic per-device sequence for tie-breaking.
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOffer {
+    pub transfer_id: TransferId,
+    pub from_device_id: DeviceId,
+    pub name: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// SHA-256 hex of the full file content.
+    pub sha256: String,
+    /// MIME type hint.
+    pub mime: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub transfer_id: TransferId,
+    /// Byte offset of this chunk.
+    pub offset: u64,
+    /// Raw chunk bytes.
+    pub data: Vec<u8>,
+    /// Whether this is the final chunk.
+    pub last: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStatus {
+    Offered,
+    Accepted,
+    Rejected,
+    InProgress,
+    Completed,
+    Cancelled,
+    Failed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
@@ -51,6 +113,27 @@ pub enum Message {
     },
     Error {
         message: String,
+    },
+
+    // Phase 2: clipboard sync
+    ClipboardUpdate(ClipboardPayload),
+
+    // Phase 2: file transfer
+    FileTransferOffer(FileOffer),
+    FileTransferAccept {
+        transfer_id: TransferId,
+    },
+    FileTransferReject {
+        transfer_id: TransferId,
+        reason: Option<String>,
+    },
+    FileTransferChunk(FileChunk),
+    FileTransferComplete {
+        transfer_id: TransferId,
+    },
+    FileTransferCancel {
+        transfer_id: TransferId,
+        reason: Option<String>,
     },
 }
 
@@ -89,19 +172,98 @@ mod tests {
 
     #[test]
     fn hello_round_trip() {
-        let m = Message::Hello { version: 1, device_id: "pc-a".into(), name: "PC A".into() };
+        let m = Message::Hello {
+            version: PROTOCOL_VERSION,
+            device_id: "pc-a".into(),
+            name: "PC A".into(),
+        };
         assert_eq!(decode(&encode(&m)).unwrap(), m);
     }
 
     #[test]
-    fn rejects_wrong_version() {
-        let bytes = encode(&Message::Hello { version: 99, device_id: "x".into(), name: "X".into() });
-        assert!(decode(&bytes).is_err());
+    fn rejects_wrong_version_header() {
+        let mut bytes = encode(&Message::Hello {
+            version: PROTOCOL_VERSION,
+            device_id: "x".into(),
+            name: "X".into(),
+        });
+        bytes[0] = 99;
+        bytes[1] = 0;
+        assert_eq!(decode(&bytes).unwrap_err(), ProtocolError::VersionMismatch);
+    }
+
+    #[test]
+    fn rejects_wrong_hello_version_field() {
+        let bytes = encode(&Message::Hello {
+            version: 99,
+            device_id: "x".into(),
+            name: "X".into(),
+        });
+        assert_eq!(decode(&bytes).unwrap_err(), ProtocolError::VersionMismatch);
     }
 
     #[test]
     fn rejects_truncated_and_garbage_without_panicking() {
-        assert!(decode(&[1]).is_err());
-        assert!(decode(&[1, 0, 0xff, 0xff, 0x00]).is_err());
+        assert_eq!(decode(&[1]).unwrap_err(), ProtocolError::TooShort);
+        assert_eq!(
+            decode(&[PROTOCOL_VERSION as u8, 0, 0xff, 0xff, 0x00]).unwrap_err(),
+            ProtocolError::InvalidPayload
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_body() {
+        let mut bytes = PROTOCOL_VERSION.to_le_bytes().to_vec();
+        bytes.extend(std::iter::repeat(0u8).take(MAX_BODY_LEN + 1));
+        assert_eq!(decode(&bytes).unwrap_err(), ProtocolError::TooLarge);
+    }
+
+    #[test]
+    fn clipboard_update_round_trip() {
+        let m = Message::ClipboardUpdate(ClipboardPayload {
+            device_id: "pc-a".into(),
+            kind: ClipboardKind::Text,
+            text: Some("hello".into()),
+            data_base64: None,
+            mime: Some("text/plain".into()),
+            timestamp_ms: 123,
+            seq: 4,
+        });
+        assert_eq!(decode(&encode(&m)).unwrap(), m);
+    }
+
+    #[test]
+    fn file_transfer_round_trip() {
+        let offer = Message::FileTransferOffer(FileOffer {
+            transfer_id: "t1".into(),
+            from_device_id: "pc-a".into(),
+            name: "note.txt".into(),
+            size: 5,
+            sha256: "abcd".into(),
+            mime: Some("text/plain".into()),
+        });
+        assert_eq!(decode(&encode(&offer)).unwrap(), offer);
+
+        let chunk = Message::FileTransferChunk(FileChunk {
+            transfer_id: "t1".into(),
+            offset: 0,
+            data: b"hello".to_vec(),
+            last: true,
+        });
+        assert_eq!(decode(&encode(&chunk)).unwrap(), chunk);
+
+        let accept = Message::FileTransferAccept {
+            transfer_id: "t1".into(),
+        };
+        assert_eq!(decode(&encode(&accept)).unwrap(), accept);
+        let complete = Message::FileTransferComplete {
+            transfer_id: "t1".into(),
+        };
+        assert_eq!(decode(&encode(&complete)).unwrap(), complete);
+        let cancel = Message::FileTransferCancel {
+            transfer_id: "t1".into(),
+            reason: Some("user".into()),
+        };
+        assert_eq!(decode(&encode(&cancel)).unwrap(), cancel);
     }
 }
