@@ -4,10 +4,12 @@ myMouse is a local-first software KVM app: share one keyboard and mouse across
 nearby computers, with its own protocol, trust store, and interface. It is a
 from-scratch alternative, not a wrapper around any installed application.
 
-**Current scope: Phase 1 — Windows host ↔ Windows target.** Android and Apple
-Silicon Mac targets, clipboard sync, file drop, and remote screen are planned
-for later phases. Builds are **unsigned** until a code-signing certificate is
-provided.
+**Current scope: Phase 1 — Windows host ↔ Windows target (implemented).**
+Phase 4 adds an **Apple Silicon Mac target/helper scaffold** under
+`apps/mac/` (Swift package/app skeleton, docs, packaging notes); it has not
+been built or runtime-verified on this Windows host. Android, clipboard sync,
+file drop, and remote screen remain planned/incomplete. Builds are **unsigned**
+until a code-signing certificate is provided.
 
 ## What is included
 
@@ -111,6 +113,7 @@ See [docs/limitations.md](docs/limitations.md). In short:
 
 ```
 myMouse/
+  apps/mac/         Phase 4 Apple Silicon Mac target/helper scaffold (Swift)
   electron/         Electron main, preload, JSON-RPC bridge
   src/              React UI
   shared/protocol/  Versioned binary message protocol

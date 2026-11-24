@@ -10,7 +10,7 @@
 
 ## Platform scope
 
-- Phase 1 targets Windows host ↔ Windows target. Android and Apple Silicon Mac targets are planned for later phases. Android/Mac builds can be compiled or emulated on this host, but real-device verification cannot be completed here.
+- Phase 1 targets Windows host ↔ Windows target. Android is planned for a later phase. Phase 4 adds an **Apple Silicon Mac target/helper scaffold** in `myMouse/apps/mac/` (Swift package/app skeleton, CGEvent injection scaffold, ScreenCaptureKit interface/stub, trust/pairing placeholders, transport integration plan, packaging notes). It is **source-only on this Windows host**: no `swift build`/runtime verification, no macOS permission prompts, no ScreenCaptureKit capture, no pinned transport interop, and no signing/notarization were executed here. Real Apple Silicon verification is required before calling the Mac target shipped.
 - Clipboard sync, file transfer / Quick Drop, and live screen streaming are planned for later phases; the UI currently shows placeholders for these features.
 
 ## Security and installation
