@@ -1,20 +1,29 @@
 mod clipboard;
 mod discovery;
 mod file_transfer;
+mod identity;
 mod input;
 mod layout;
+mod network;
 mod pairing;
 mod test_mode;
 mod transport;
 mod trust;
 
-use clipboard::{ClipboardManager, ClipboardSettings};
+use clipboard::{ClipboardManager, ClipboardMode, ClipboardSettings, ClipboardSnapshot};
 use file_transfer::{FileTransferManager, FileTransferSettings};
+use identity::Identity;
+use mymouse_protocol::{ClipboardKind, Message, PROTOCOL_VERSION};
+use network::PeerRuntimeHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::{timeout, Duration};
+use transport::Server;
 use trust::TrustStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -42,11 +51,17 @@ struct AppState {
     clipboard: ClipboardManager,
     transfers: FileTransferManager,
     config_dir: PathBuf,
+    /// Pairing token for this install, filled in when production starts.
+    identity_fingerprint: String,
+    listen_port: u16,
 }
 
 impl AppState {
     fn new(config_dir: PathBuf) -> Self {
-        let device_id = "local-pc".to_string();
+        Self::with_device_id(config_dir, "local-pc".to_string())
+    }
+
+    fn with_device_id(config_dir: PathBuf, device_id: String) -> Self {
         let settings_path = config_dir.join("settings.json");
         let settings: AppSettings = std::fs::read_to_string(&settings_path)
             .ok()
@@ -62,6 +77,8 @@ impl AppState {
             clipboard,
             transfers,
             config_dir,
+            identity_fingerprint: String::new(),
+            listen_port: 0,
         }
     }
 
@@ -102,14 +119,96 @@ fn rpc_err(id: u64, message: &str) {
     emit(json!({ "id": id, "result": { "ok": false, "error": message } }));
 }
 
-fn handle_request(state: &Arc<Mutex<AppState>>, id: u64, request: &Value) {
+/// Shared by production and test-mode IPC so both expose identical settings
+/// and clipboard-send behaviour.
+pub(crate) fn apply_clipboard_settings(state: &mut AppState, params: &Value) {
+    if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
+        state.settings.clipboard.enabled = enabled;
+    }
+    if let Some(mode) = params.get("mode").and_then(Value::as_str) {
+        state.settings.clipboard.mode = match mode {
+            "cursor_scoped" | "cursorScoped" => ClipboardMode::CursorScoped,
+            _ => ClipboardMode::Global,
+        };
+    }
+    let settings = state.settings.clipboard.clone();
+    state.clipboard.set_settings(settings);
+    let _ = state.save_settings();
+}
+
+pub(crate) fn apply_file_transfer_settings(state: &mut AppState, params: &Value) {
+    if let Some(auto_accept) = params.get("autoAccept").and_then(Value::as_bool) {
+        state.settings.file_transfer.auto_accept = auto_accept;
+    }
+    if let Some(save_dir) = params.get("saveDir").and_then(Value::as_str) {
+        if !save_dir.trim().is_empty() {
+            state.settings.file_transfer.save_dir = save_dir.to_string();
+        }
+    }
+    if let Some(max) = params.get("maxTransferBytes").and_then(Value::as_u64) {
+        state.settings.file_transfer.max_transfer_bytes = max.max(1024);
+    }
+    let settings = state.settings.file_transfer.clone();
+    state.transfers.set_settings(settings);
+    let _ = state.save_settings();
+}
+
+pub(crate) fn clipboard_message_from_params(
+    manager: &ClipboardManager,
+    params: &Value,
+) -> Option<Message> {
+    let kind = match params.get("kind").and_then(Value::as_str).unwrap_or("text") {
+        "image" => ClipboardKind::Image,
+        _ => ClipboardKind::Text,
+    };
+    let text = params.get("text").and_then(Value::as_str).map(str::to_string);
+    let data_base64 = params
+        .get("dataBase64")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("data_base64").and_then(Value::as_str))
+        .map(str::to_string);
+    let mime = params.get("mime").and_then(Value::as_str).map(str::to_string);
+    manager.build_update(ClipboardSnapshot {
+        kind,
+        text,
+        data_base64,
+        mime,
+    })
+}
+
+fn is_hex_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+async fn handle_request(
+    state: &Arc<Mutex<AppState>>,
+    network: &PeerRuntimeHandle,
+    id: u64,
+    request: &Value,
+) {
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
 
     match method {
         "status" => {
+            let connected = network.connected().await;
+            let device_id = state.lock().unwrap().device_id.clone();
+            rpc_ok(
+                id,
+                json!({ "ok": true, "connected": connected, "deviceId": device_id }),
+            );
+        }
+        "localIdentity" => {
             let st = state.lock().unwrap();
-            rpc_ok(id, json!({ "ok": true, "connected": false, "deviceId": st.device_id }));
+            rpc_ok(
+                id,
+                json!({
+                    "ok": true,
+                    "deviceId": st.device_id,
+                    "fingerprint": st.identity_fingerprint,
+                    "listenPort": st.listen_port,
+                }),
+            );
         }
         "devices" => {
             let st = state.lock().unwrap();
@@ -120,6 +219,36 @@ fn handle_request(state: &Arc<Mutex<AppState>>, id: u64, request: &Value) {
                 .map(|(id, caps)| json!({ "id": id, "name": id, "capabilities": caps }))
                 .collect();
             rpc_ok(id, json!(devices));
+        }
+        "connectPeer" => {
+            let address = params.get("address").and_then(Value::as_str).unwrap_or("");
+            let peer_id = params
+                .get("peerDeviceId")
+                .and_then(Value::as_str)
+                .unwrap_or("peer")
+                .to_string();
+            let fingerprint = params
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !is_hex_fingerprint(fingerprint) {
+                return rpc_err(id, "fingerprint must be 64 hex characters");
+            }
+            if let Some(pinned) = state.lock().unwrap().trust.fingerprint(&peer_id) {
+                if !pinned.eq_ignore_ascii_case(fingerprint) {
+                    return rpc_err(id, "fingerprint does not match pinned trust entry");
+                }
+            }
+            let Ok(address) = address.parse::<SocketAddr>() else {
+                return rpc_err(id, "address must be host:port");
+            };
+            match network
+                .connect(address, fingerprint.to_ascii_lowercase(), peer_id)
+                .await
+            {
+                Ok(()) => rpc_ok(id, json!({ "ok": true })),
+                Err(error) => rpc_err(id, &error),
+            }
         }
         "pairingUri" => {
             let session = pairing::PairSession::new("local-pc");
@@ -139,36 +268,12 @@ fn handle_request(state: &Arc<Mutex<AppState>>, id: u64, request: &Value) {
         }
         "setClipboardSettings" => {
             let mut st = state.lock().unwrap();
-            if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
-                st.settings.clipboard.enabled = enabled;
-            }
-            if let Some(mode) = params.get("mode").and_then(Value::as_str) {
-                st.settings.clipboard.mode = match mode {
-                    "cursor_scoped" | "cursorScoped" => clipboard::ClipboardMode::CursorScoped,
-                    _ => clipboard::ClipboardMode::Global,
-                };
-            }
-            let s = st.settings.clipboard.clone();
-            st.clipboard.set_settings(s);
-            let _ = st.save_settings();
+            apply_clipboard_settings(&mut st, &params);
             rpc_ok(id, json!({ "ok": true, "settings": st.settings.clipboard }));
         }
         "setFileTransferSettings" => {
             let mut st = state.lock().unwrap();
-            if let Some(auto_accept) = params.get("autoAccept").and_then(Value::as_bool) {
-                st.settings.file_transfer.auto_accept = auto_accept;
-            }
-            if let Some(save_dir) = params.get("saveDir").and_then(Value::as_str) {
-                if !save_dir.trim().is_empty() {
-                    st.settings.file_transfer.save_dir = save_dir.to_string();
-                }
-            }
-            if let Some(max) = params.get("maxTransferBytes").and_then(Value::as_u64) {
-                st.settings.file_transfer.max_transfer_bytes = max.max(1024);
-            }
-            let s = st.settings.file_transfer.clone();
-            st.transfers.set_settings(s);
-            let _ = st.save_settings();
+            apply_file_transfer_settings(&mut st, &params);
             rpc_ok(id, json!({ "ok": true, "settings": st.settings.file_transfer }));
         }
         "listTransfers" => {
@@ -177,26 +282,67 @@ fn handle_request(state: &Arc<Mutex<AppState>>, id: u64, request: &Value) {
         }
         "acceptTransfer" => {
             let transfer_id = params.get("transferId").and_then(Value::as_str).unwrap_or("");
-            let mut st = state.lock().unwrap();
-            match st.transfers.accept(transfer_id) {
-                Ok(msgs) => rpc_ok(id, json!({ "ok": true, "messages": msgs.len() })),
-                Err(e) => rpc_err(id, &e.to_string()),
+            let messages = {
+                let mut st = state.lock().unwrap();
+                st.transfers.accept(transfer_id)
+            };
+            match messages {
+                Ok(messages) => {
+                    let count = messages.len();
+                    for message in messages {
+                        if let Err(error) = network.send(message).await {
+                            return rpc_err(id, &error);
+                        }
+                    }
+                    rpc_ok(id, json!({ "ok": true, "messages": count }));
+                }
+                Err(error) => rpc_err(id, &error.to_string()),
             }
         }
         "rejectTransfer" => {
             let transfer_id = params.get("transferId").and_then(Value::as_str).unwrap_or("");
             let reason = params.get("reason").and_then(Value::as_str).map(|s| s.to_string());
-            let mut st = state.lock().unwrap();
-            st.transfers.reject(transfer_id, reason);
+            let messages = {
+                let mut st = state.lock().unwrap();
+                st.transfers.reject(transfer_id, reason)
+            };
+            for message in messages {
+                if let Err(error) = network.send(message).await {
+                    return rpc_err(id, &error);
+                }
+            }
             rpc_ok(id, json!({ "ok": true }));
         }
         "offerFile" => {
             let path = params.get("path").and_then(Value::as_str).unwrap_or("");
             let peer = params.get("peerDeviceId").and_then(Value::as_str).unwrap_or("peer");
-            let mut st = state.lock().unwrap();
-            match st.transfers.create_offer(Path::new(path), peer) {
-                Ok((offer, _msgs)) => rpc_ok(id, json!({ "ok": true, "offer": offer })),
-                Err(e) => rpc_err(id, &e.to_string()),
+            let offer = {
+                let mut st = state.lock().unwrap();
+                st.transfers
+                    .create_offer(std::path::Path::new(path), peer)
+                    .map(|(offer, _)| offer)
+            };
+            match offer {
+                Ok(offer) => {
+                    if let Err(error) = network.send(Message::FileTransferOffer(offer.clone())).await {
+                        return rpc_err(id, &error);
+                    }
+                    rpc_ok(id, json!({ "ok": true, "offer": offer }));
+                }
+                Err(error) => rpc_err(id, &error.to_string()),
+            }
+        }
+        "sendClipboard" | "clipboardWrite" => {
+            let message = {
+                let st = state.lock().unwrap();
+                clipboard_message_from_params(&st.clipboard, &params)
+            };
+            match message {
+                Some(message) => match network.send(message).await {
+                    Ok(()) => rpc_ok(id, json!({ "ok": true })),
+                    Err(error) => rpc_err(id, &error),
+                },
+                None => rpc_err(id, "clipboard disabled, duplicate or oversized"),
             }
         }
         "clipboardRead" => {
@@ -215,6 +361,7 @@ fn handle_request(state: &Arc<Mutex<AppState>>, id: u64, request: &Value) {
             }
         }
         "quit" => {
+            network.shutdown();
             rpc_ok(id, json!({ "ok": true }));
             std::process::exit(0);
         }
@@ -222,11 +369,129 @@ fn handle_request(state: &Arc<Mutex<AppState>>, id: u64, request: &Value) {
     }
 }
 
-fn run_ipc() {
-    let state = Arc::new(Mutex::new(AppState::new(config_dir())));
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+/// A peer must announce itself with a v2 `Hello` naming a device already in
+/// the trust store with at least one usable capability. Anything else is
+/// dropped before the stream reaches the message dispatcher.
+fn authorize_inbound_hello(state: &Arc<Mutex<AppState>>, message: &Message) -> Option<String> {
+    let Message::Hello {
+        version,
+        device_id,
+        name: _,
+    } = message
+    else {
+        return None;
+    };
+    if *version != PROTOCOL_VERSION {
+        return None;
+    }
+    let st = state.lock().unwrap();
+    if !st.trust.is_trusted(device_id) {
+        return None;
+    }
+    let usable = st
+        .trust
+        .capabilities(device_id)
+        .map(|cap| cap.input || cap.clipboard || cap.files)
+        .unwrap_or(false);
+    usable.then(|| device_id.clone())
+}
+
+/// Handshake gate for production inbound peers. TLS is already pinned by the
+/// transport; this adds an identity/capability check before any application
+/// message (clipboard, files, input) is dispatched.
+async fn accept_inbound_loop(
+    server: Server,
+    state: Arc<Mutex<AppState>>,
+    network: PeerRuntimeHandle,
+) {
+    loop {
+        let mut stream = match server.accept().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                emit(json!({ "notification": "listener-error", "error": error.to_string() }));
+                break;
+            }
+        };
+        let peer_id = match timeout(Duration::from_secs(5), stream.recv()).await {
+            Ok(Ok(message)) => authorize_inbound_hello(&state, &message),
+            Ok(Err(error)) => {
+                emit(json!({
+                    "notification": "inboundRejected",
+                    "reason": format!("handshake failed: {error}"),
+                }));
+                None
+            }
+            Err(_) => {
+                emit(json!({
+                    "notification": "inboundRejected",
+                    "reason": "handshake timed out",
+                }));
+                None
+            }
+        };
+        let Some(peer_id) = peer_id else {
+            emit(json!({
+                "notification": "inboundRejected",
+                "reason": "untrusted peer",
+            }));
+            continue;
+        };
+        emit(json!({
+            "notification": "inboundPeer",
+            "deviceId": peer_id,
+            "message": "trusted peer attached",
+        }));
+        if network.attach_inbound(stream, peer_id).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn run_ipc() {
+    let config = config_dir();
+    let state = Arc::new(Mutex::new(AppState::new(config.clone())));
+    let device_id = state.lock().unwrap().device_id.clone();
+    let network = network::start(state.clone(), device_id, String::new(), true);
+
+    // Production identity is generated once and reused; its fingerprint is the
+    // public pairing token. The private key never leaves the config directory.
+    let identity = match Identity::load_or_create(&config) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("mymouse: could not load TLS identity: {error}");
+            return;
+        }
+    };
+    let port = std::env::var("MYMOUSE_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(24800);
+    match Server::bind(
+        &format!("0.0.0.0:{port}"),
+        identity.cert_der.clone(),
+        identity.key_der.clone(),
+    )
+    .await
+    {
+        Ok(server) => {
+            {
+                let mut st = state.lock().unwrap();
+                st.identity_fingerprint = identity.fingerprint().to_string();
+                st.listen_port = server.local_addr().port();
+            }
+            let listener_state = state.clone();
+            let listener_network = network.clone();
+            tokio::spawn(accept_inbound_loop(server, listener_state, listener_network));
+        }
+        Err(error) => {
+            eprintln!("mymouse: could not bind pinned TLS listener: {error}");
+            let mut st = state.lock().unwrap();
+            st.identity_fingerprint = identity.fingerprint().to_string();
+        }
+    }
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
@@ -234,8 +499,9 @@ fn run_ipc() {
             continue;
         };
         let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
-        handle_request(&state, id, &request);
+        handle_request(&state, &network, id, &request).await;
     }
+    network.shutdown();
 }
 
 #[tokio::main]
@@ -249,17 +515,61 @@ async fn main() {
         return;
     }
     if args.iter().any(|a| a == "--ipc" || a == "stdio") {
-        run_ipc();
+        run_ipc().await;
         return;
     }
     // Default: run IPC loop (Electron spawns with --ipc stdio; also safe default).
-    run_ipc();
+    run_ipc().await;
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use trust::Capabilities;
+
+    fn hello(version: u16, device_id: &str) -> Message {
+        Message::Hello {
+            version,
+            device_id: device_id.to_string(),
+            name: "Peer".to_string(),
+        }
+    }
+
     #[test]
     fn scaffold_compiles() {
         assert_eq!(env!("CARGO_PKG_NAME"), "mymouse-backend");
+    }
+
+    #[test]
+    fn inbound_hello_requires_trust_and_supported_version() {
+        let mut state = AppState::with_device_id(std::env::temp_dir(), "local-pc".to_string());
+        state.trust.grant("pc-b", Capabilities::default());
+        let state = Arc::new(Mutex::new(state));
+
+        assert_eq!(
+            authorize_inbound_hello(&state, &hello(PROTOCOL_VERSION, "pc-b")),
+            Some("pc-b".to_string())
+        );
+        assert_eq!(authorize_inbound_hello(&state, &hello(999, "pc-b")), None);
+        assert_eq!(
+            authorize_inbound_hello(&state, &hello(PROTOCOL_VERSION, "stranger")),
+            None
+        );
+        assert_eq!(
+            authorize_inbound_hello(
+                &state,
+                &Message::ClipboardUpdate(mymouse_protocol::ClipboardPayload {
+                    device_id: "pc-b".to_string(),
+                    kind: mymouse_protocol::ClipboardKind::Text,
+                    text: Some("skip".to_string()),
+                    data_base64: None,
+                    mime: None,
+                    timestamp_ms: 1,
+                    seq: 1,
+                })
+            ),
+            None
+        );
     }
 }

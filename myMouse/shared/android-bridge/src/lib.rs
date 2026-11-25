@@ -19,7 +19,10 @@ pub mod trust;
 pub use discovery::{parse_service_name, DiscoveredPeer, DEFAULT_PORT, SERVICE_TYPE};
 pub use pairing::{generate_pairing_code, pairing_uri, parse_pairing_uri, PairingSession, ParsedPairingUri};
 pub use protocol::{decode_message, encode_message, protocol_version, BridgeMessage, BridgeProtocolError};
-pub use transport::{decode_frame_payload, encode_frame, frame_length, TransportConfig, MAX_FRAME_LEN};
+pub use transport::{
+    certificate_fingerprint, decode_frame, decode_frame_payload, encode_frame, frame_length,
+    is_valid_frame_length, normalize_fingerprint, TransportConfig, MAX_FRAME_LEN,
+};
 pub use trust::{Capabilities, TrustStoreModel, TrustedDeviceRecord};
 
 /// Simple version string for diagnostics from Kotlin.

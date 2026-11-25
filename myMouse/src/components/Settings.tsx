@@ -9,6 +9,30 @@ type Props = {
 
 export default function Settings({ settings, onChange, onRefresh }: Props) {
   const [saveDir, setSaveDir] = useState(settings.file_transfer.save_dir);
+  const [peerAddress, setPeerAddress] = useState('');
+  const [peerId, setPeerId] = useState('');
+  const [fingerprint, setFingerprint] = useState('');
+  const [connectionMessage, setConnectionMessage] = useState('');
+  const [localFingerprint, setLocalFingerprint] = useState('');
+
+  const showLocalIdentity = async () => {
+    const identity = await window.mymouse.localIdentity();
+    if (identity.ok && identity.fingerprint) {
+      setLocalFingerprint(`${identity.deviceId ?? 'local-pc'}:${identity.listenPort ?? 0} — ${identity.fingerprint}`);
+    } else {
+      setLocalFingerprint(identity.error ?? 'Could not read local identity.');
+    }
+  };
+
+  const connectPeer = async () => {
+    if (!/^[0-9a-fA-F]{64}$/.test(fingerprint.trim())) {
+      setConnectionMessage('Fingerprint must be 64 hex characters.');
+      return;
+    }
+    const result = await window.mymouse.connectPeer(peerAddress.trim(), peerId.trim(), fingerprint.trim());
+    setConnectionMessage(result.ok ? 'Connected to pinned peer.' : (result.error ?? 'Connection failed.'));
+    await onRefresh();
+  };
 
   const updateClipboard = async (patch: { enabled?: boolean; mode?: 'global' | 'cursor_scoped' }) => {
     const result = await window.mymouse.setClipboardSettings(patch);
@@ -82,6 +106,25 @@ export default function Settings({ settings, onChange, onRefresh }: Props) {
           }}
         />
       </label>
+
+      <h2>Peer connection</h2>
+      <p className="hint">Connect only to a peer whose certificate fingerprint you have verified.</p>
+      <button onClick={() => void showLocalIdentity()}>Show my fingerprint</button>
+      {localFingerprint && <p className="hint">{localFingerprint}</p>}
+      <label>
+        Address (host:port)
+        <input aria-label="Peer address" value={peerAddress} onChange={(e) => setPeerAddress(e.target.value)} />
+      </label>
+      <label>
+        Peer device ID
+        <input aria-label="Peer device ID" value={peerId} onChange={(e) => setPeerId(e.target.value)} />
+      </label>
+      <label>
+        Pinned SHA-256 fingerprint
+        <input aria-label="Pinned fingerprint" value={fingerprint} onChange={(e) => setFingerprint(e.target.value)} />
+      </label>
+      <button onClick={() => void connectPeer()}>Connect with pinned fingerprint</button>
+      {connectionMessage && <p className="hint">{connectionMessage}</p>}
 
       <h2>General</h2>
       <label><input type="checkbox" checked={settings.auto_reconnect} readOnly /> Auto reconnect</label>

@@ -4,7 +4,9 @@ import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import androidx.appcompat.app.AppCompatActivity
+import com.mymouse.android.bridge.SessionRegistry
 import com.mymouse.android.databinding.ActivitySettingsBinding
+import com.mymouse.android.service.InputRouter
 
 class SettingsActivity : AppCompatActivity() {
     private lateinit var binding: ActivitySettingsBinding
@@ -26,6 +28,21 @@ class SettingsActivity : AppCompatActivity() {
         }
         binding.btnOpenNotifications.setOnClickListener {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        binding.btnPanicDisable.setOnClickListener {
+            InputRouter.panicDisable("user pressed the panic button")
+            SessionRegistry.clear() // close the pinned socket as well
+            binding.settingsStatus.text =
+                "PANIC: input injection disabled and pinned session closed. Re-pair explicitly to reconnect."
+        }
+        binding.btnResumeInput.setOnClickListener {
+            InputRouter.clearPanic()
+            binding.settingsStatus.text =
+                "Panic cleared. Input still requires Accessibility enablement, a paired pinned host, and the input toggle."
+        }
+        if (InputRouter.isPanicDisabled) {
+            binding.settingsStatus.text =
+                "Input is currently panic-disabled (${InputRouter.panicReasonText}). Use Re-enable input to clear."
         }
     }
 

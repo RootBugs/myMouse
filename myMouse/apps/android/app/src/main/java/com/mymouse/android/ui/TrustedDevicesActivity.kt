@@ -35,7 +35,7 @@ class TrustedDevicesActivity : AppCompatActivity() {
             override fun onBindViewHolder(holder: VH, position: Int) {
                 val d = devices[position]
                 holder.textView.text =
-                    "${d.name}\nID: ${d.deviceId}\nCaps: input=${d.capabilities.input}, clipboard=${d.capabilities.clipboard}, files=${d.capabilities.files}, screen=${d.capabilities.screen}\nFingerprint: ${d.fingerprint ?: "(not pinned in scaffold)"}\nTap to revoke"
+                    "${d.name}\nID: ${d.deviceId}\nCaps: input=${d.capabilities.input}, clipboard=${d.capabilities.clipboard}, files=${d.capabilities.files}, screen=${d.capabilities.screen}\nFingerprint: ${d.fingerprint ?: "(none — cannot connect)"}\nTap to revoke"
                 holder.textView.setOnClickListener {
                     (application as MyMouseApp).trustStore.revoke(d.deviceId)
                     refresh()

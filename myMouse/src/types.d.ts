@@ -50,6 +50,11 @@ declare global {
       acceptTransfer: (transferId: string) => Promise<{ ok: boolean; error?: string }>;
       rejectTransfer: (transferId: string, reason?: string) => Promise<{ ok: boolean; error?: string }>;
       offerFile: (path: string, peerDeviceId?: string) => Promise<{ ok: boolean; offer?: unknown; error?: string }>;
+      sendClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
+      connectPeer: (address: string, peerDeviceId: string, fingerprint: string) => Promise<{ ok: boolean; error?: string }>;
+      localIdentity: () => Promise<{ ok: boolean; deviceId?: string; fingerprint?: string; listenPort?: number; error?: string }>;
+
+      onNotification?: (cb: (message: Record<string, unknown>) => void) => () => void;
     };
   }
 }

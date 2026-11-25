@@ -12,6 +12,11 @@ function startBackend(): void {
     : path.join(__dirname, '..', 'backend', 'target', 'debug', 'mymouse-backend.exe');
   backend = spawn(exe, ['--ipc', 'stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
   bridge = new Bridge(backend as unknown as ConstructorParameters<typeof Bridge>[0]);
+  bridge.onNotification((message) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send('mymouse:notification', message);
+    }
+  });
 
   ipcMain.handle('mymouse:call', (_event, method: string, params: unknown) => {
     return bridge!.send(method, params);

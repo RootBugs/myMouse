@@ -19,4 +19,15 @@ contextBridge.exposeInMainWorld('mymouse', {
     ipcRenderer.invoke('mymouse:call', 'rejectTransfer', { transferId, reason }),
   offerFile: (path: string, peerDeviceId?: string) =>
     ipcRenderer.invoke('mymouse:call', 'offerFile', { path, peerDeviceId }),
+  sendClipboard: (text: string) =>
+    ipcRenderer.invoke('mymouse:call', 'sendClipboard', { text }),
+  connectPeer: (address: string, peerDeviceId: string, fingerprint: string) =>
+    ipcRenderer.invoke('mymouse:call', 'connectPeer', { address, peerDeviceId, fingerprint }),
+  localIdentity: () => ipcRenderer.invoke('mymouse:call', 'localIdentity'),
+
+  onNotification: (cb: (message: unknown) => void) => {
+    const listener = (_event: unknown, message: unknown) => cb(message);
+    ipcRenderer.on('mymouse:notification', listener);
+    return () => ipcRenderer.removeListener('mymouse:notification', listener);
+  },
 });

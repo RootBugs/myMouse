@@ -446,6 +446,26 @@ impl FileTransferManager {
         Ok(incoming.record)
     }
 
+    /// Apply a rejection received from the peer.
+    pub fn handle_reject(&mut self, transfer_id: &str, reason: Option<String>) -> Option<TransferRecord> {
+        if let Some(mut outgoing) = self.outgoing.remove(transfer_id) {
+            outgoing.record.state = TransferState::Rejected;
+            outgoing.record.message = reason;
+            outgoing.record.updated_at_ms = now_ms();
+            self.push_history(outgoing.record.clone());
+            return Some(outgoing.record);
+        }
+        if let Some(mut incoming) = self.incoming.remove(transfer_id) {
+            let _ = fs::remove_file(&incoming.part_path);
+            incoming.record.state = TransferState::Rejected;
+            incoming.record.message = reason;
+            incoming.record.updated_at_ms = now_ms();
+            self.push_history(incoming.record.clone());
+            return Some(incoming.record);
+        }
+        None
+    }
+
     pub fn handle_cancel(&mut self, transfer_id: &str, reason: Option<String>) -> Option<TransferRecord> {
         if let Some(mut incoming) = self.incoming.remove(transfer_id) {
             let _ = fs::remove_file(&incoming.part_path);

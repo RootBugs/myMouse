@@ -4,15 +4,23 @@
 //! certificates. Test mode replaces discovery with a static peer list, uses a
 //! single fixed test certificate for both instances, and replaces OS input
 //! hooks with synthetic crossing commands driven over stdio JSON lines.
+//! Clipboard and file messages travel through the same peer runtime and the
+//! same pinned-TLS transport; OS clipboard writes and key injection stay off.
 
 use crate::input::{CapturedEvent, InputBridge};
 use crate::layout::{Edge, Layout, Node, Side};
-use crate::transport::{Client, PeerStream, Server};
+use crate::network::{start as start_network, PeerRuntimeHandle};
+use crate::transport::{Client, Server};
+use crate::{
+    apply_clipboard_settings, apply_file_transfer_settings, clipboard_message_from_params,
+    config_dir, AppState,
+};
 use mymouse_protocol::Message;
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -82,6 +90,14 @@ fn emit(value: Value) {
     let _ = io::stdout().flush();
 }
 
+fn rpc_response(id: u64, result: Value) {
+    emit(json!({ "id": id, "result": result }));
+}
+
+fn rpc_err(id: u64, message: &str) {
+    rpc_response(id, json!({ "ok": false, "error": message }));
+}
+
 fn build_layout(device_id: &str, peer_id: &str) -> Layout {
     // Small synthetic screens make (100, 200) sit on the configured right edge.
     let mut layout = Layout::new();
@@ -95,17 +111,13 @@ fn build_layout(device_id: &str, peer_id: &str) -> Layout {
     layout
 }
 
-fn rpc_response(id: u64, result: Value) {
-    emit(json!({ "id": id, "result": result }));
-}
-
 /// Drive one synthetic cursor crossing through the real layout + input bridge
-/// and forward the resulting `InputEvent` to the connected peer. Shared by the
-/// stdio RPC handler and the startup `--cross-to` flag.
+/// and forward the resulting `InputEvent` through the peer runtime. Shared by
+/// the stdio RPC handler and the startup `--cross-to` flag.
 async fn send_crossing(
     layout: &Layout,
     device_id: &str,
-    outbound: &mut Option<PeerStream>,
+    network: &PeerRuntimeHandle,
     target: &str,
     x: u32,
     y: u32,
@@ -123,11 +135,8 @@ async fn send_crossing(
     let Some(Message::InputEvent { target, payload }) = rx.recv().await else {
         return Err("input bridge did not emit event".into());
     };
-    let stream = outbound
-        .as_mut()
-        .ok_or_else(|| "no peer connected".to_string())?;
-    stream
-        .send(&Message::InputEvent { target, payload })
+    network
+        .send(Message::InputEvent { target, payload })
         .await
         .map_err(|error| error.to_string())?;
     emit(json!({
@@ -143,9 +152,23 @@ async fn send_crossing(
     }))
 }
 
+async fn send_messages(network: &PeerRuntimeHandle, messages: Vec<Message>) -> Result<usize, String> {
+    let count = messages.len();
+    for message in messages {
+        network.send(message).await?;
+    }
+    Ok(count)
+}
+
 pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     let device_id = config.device_id.clone();
     let peer_id = config.peer_id.clone();
+    let state = Arc::new(Mutex::new(AppState::with_device_id(
+        config_dir(),
+        device_id.clone(),
+    )));
+    let network = start_network(state.clone(), device_id.clone(), peer_id.clone(), false);
+
     let server = Server::bind(
         &format!("127.0.0.1:{}", config.port),
         hex_decode(TEST_CERT_HEX),
@@ -158,13 +181,18 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
         "port": config.port
     }));
 
-    let (streams_tx, mut streams_rx) = mpsc::unbounded_channel::<PeerStream>();
-    let accept_server = server;
+    let accept_network = network.clone();
+    let accept_peer_id = peer_id.clone();
     tokio::spawn(async move {
         loop {
-            match accept_server.accept().await {
+            match server.accept().await {
                 Ok(stream) => {
-                    if streams_tx.send(stream).is_err() {
+                    emit(json!({ "notification": "peer-stream" }));
+                    if accept_network
+                        .attach_inbound(stream, accept_peer_id.clone())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -173,48 +201,22 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
         }
     });
 
-    // Accepted streams only receive in test mode; notification lines are the
-    // observable delivery record for both the Rust test and PowerShell script.
-    tokio::spawn(async move {
-        while let Some(mut stream) = streams_rx.recv().await {
-            tokio::spawn(async move {
-                emit(json!({ "notification": "peer-stream" }));
-                loop {
-                    match stream.recv().await {
-                        Ok(message) => match message {
-                            Message::InputEvent { target, payload } => {
-                                emit(json!({
-                                    "notification": "input",
-                                    "target": target,
-                                    "payloadHex": payload.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                                }));
-                            }
-                            other => emit(json!({
-                                "notification": "message",
-                                "debug": format!("{other:?}")
-                            })),
-                        },
-                        Err(error) => {
-                            emit(json!({
-                                "notification": "stream-error",
-                                "error": error.to_string()
-                            }));
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    let mut outbound: Option<PeerStream> = None;
     if let Some(address) = config.peer {
         let mut last_error = String::from("no attempt made");
+        let mut connected = false;
         for _ in 0..100 {
             match Client::connect(address, &[TEST_FINGERPRINT.to_string()]).await {
                 Ok(stream) => {
-                    outbound = Some(stream);
-                    break;
+                    match network
+                        .attach_outbound(stream, peer_id.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            connected = true;
+                            break;
+                        }
+                        Err(error) => last_error = error,
+                    }
                 }
                 Err(error) => {
                     last_error = error.to_string();
@@ -222,7 +224,7 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
                 }
             }
         }
-        if outbound.is_none() {
+        if !connected {
             return Err(format!(
                 "test peer {address} never accepted a pinned TLS connection: {last_error}"
             )
@@ -237,7 +239,7 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
 
     let layout = build_layout(&device_id, &peer_id);
     if let Some((target, x, y)) = config.auto_cross.clone() {
-        match send_crossing(&layout, &device_id, &mut outbound, &target, x, y).await {
+        match send_crossing(&layout, &device_id, &network, &target, x, y).await {
             Ok(result) => emit(json!({ "notification": "auto-cross", "result": result })),
             Err(error) => {
                 emit(json!({ "notification": "auto-cross-error", "error": error }));
@@ -266,39 +268,137 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
             continue 'rpc;
         };
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = request
+            .get("params")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         match method {
-            "status" => rpc_response(
-                id,
-                json!({
-                    "ok": true,
-                    "connected": outbound.is_some(),
-                    "deviceId": device_id,
-                }),
-            ),
+            "status" => {
+                let connected = network.connected().await;
+                rpc_response(
+                    id,
+                    json!({
+                        "ok": true,
+                        "connected": connected,
+                        "deviceId": device_id,
+                    }),
+                );
+            }
             "crossTo" => {
-                let target = request
-                    .get("params")
-                    .and_then(|p| p.get("target"))
+                let target = params
+                    .get("target")
                     .and_then(Value::as_str)
                     .unwrap_or(&peer_id)
                     .to_string();
-                let x = request
-                    .get("params")
-                    .and_then(|p| p.get("x"))
+                let x = params
+                    .get("x")
                     .and_then(Value::as_u64)
                     .unwrap_or(100) as u32;
-                let y = request
-                    .get("params")
-                    .and_then(|p| p.get("y"))
+                let y = params
+                    .get("y")
                     .and_then(Value::as_u64)
                     .unwrap_or(200) as u32;
 
-                match send_crossing(&layout, &device_id, &mut outbound, &target, x, y).await {
+                match send_crossing(&layout, &device_id, &network, &target, x, y).await {
                     Ok(result) => rpc_response(id, result),
                     Err(error) => rpc_response(id, json!({ "ok": false, "error": error })),
                 }
             }
+            "setClipboardSettings" => {
+                let mut st = state.lock().unwrap();
+                apply_clipboard_settings(&mut st, &params);
+                rpc_response(
+                    id,
+                    json!({ "ok": true, "settings": st.settings.clipboard }),
+                );
+            }
+            "setFileTransferSettings" => {
+                let mut st = state.lock().unwrap();
+                apply_file_transfer_settings(&mut st, &params);
+                rpc_response(
+                    id,
+                    json!({ "ok": true, "settings": st.settings.file_transfer }),
+                );
+            }
+            "listTransfers" => {
+                let st = state.lock().unwrap();
+                rpc_response(id, json!({ "ok": true, "transfers": st.transfers.history() }));
+            }
+            "acceptTransfer" => {
+                let transfer_id = params
+                    .get("transferId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let messages = {
+                    let mut st = state.lock().unwrap();
+                    st.transfers.accept(transfer_id)
+                };
+                match messages {
+                    Ok(messages) => match send_messages(&network, messages).await {
+                        Ok(count) => rpc_response(id, json!({ "ok": true, "messages": count })),
+                        Err(error) => rpc_err(id, &error),
+                    },
+                    Err(error) => rpc_err(id, &error.to_string()),
+                }
+            }
+            "rejectTransfer" => {
+                let transfer_id = params
+                    .get("transferId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let reason = params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let messages = {
+                    let mut st = state.lock().unwrap();
+                    st.transfers.reject(transfer_id, reason)
+                };
+                match send_messages(&network, messages).await {
+                    Ok(_) => rpc_response(id, json!({ "ok": true })),
+                    Err(error) => rpc_err(id, &error),
+                }
+            }
+            "offerFile" => {
+                let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                let peer = params
+                    .get("peerDeviceId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&peer_id);
+                let offer = {
+                    let mut st = state.lock().unwrap();
+                    st.transfers
+                        .create_offer(std::path::Path::new(path), peer)
+                        .map(|(offer, _)| offer)
+                };
+                match offer {
+                    Ok(offer) => {
+                        match network
+                            .send(Message::FileTransferOffer(offer.clone()))
+                            .await
+                        {
+                            Ok(()) => rpc_response(id, json!({ "ok": true, "offer": offer })),
+                            Err(error) => rpc_err(id, &error),
+                        }
+                    }
+                    Err(error) => rpc_err(id, &error.to_string()),
+                }
+            }
+            "sendClipboard" | "clipboardWrite" => {
+                let message = {
+                    let st = state.lock().unwrap();
+                    clipboard_message_from_params(&st.clipboard, &params)
+                };
+                match message {
+                    Some(message) => match network.send(message).await {
+                        Ok(()) => rpc_response(id, json!({ "ok": true })),
+                        Err(error) => rpc_err(id, &error),
+                    },
+                    None => rpc_err(id, "clipboard disabled, duplicate or oversized"),
+                }
+            }
             "quit" => {
+                network.shutdown();
                 rpc_response(id, json!({ "ok": true }));
                 break 'rpc;
             }

@@ -45,6 +45,10 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
+    const unsubscribe = window.mymouse.onNotification?.(() => {
+      void refresh();
+    });
+    return () => unsubscribe?.();
   }, [refresh]);
 
   return (

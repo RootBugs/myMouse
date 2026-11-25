@@ -4,15 +4,17 @@ myMouse is a local-first software KVM app: share one keyboard and mouse across
 nearby computers, with its own protocol, trust store, and interface. It is a
 from-scratch alternative, not a wrapper around any installed application.
 
-**Runtime-verified scope: Phase 1 - Windows host to Windows target only.**
-Phase 2 adds clipboard/file-transfer protocol messages, backend state managers,
-IPC commands, and UI panels. The peer-to-peer delivery loop is not wired yet,
-so no clipboard or file data moves between machines. Phase 3 adds an Android
-app scaffold under `apps/android/` (UI, accessibility service, stub bridge) and
-a Rust FFI bridge crate under `shared/android-bridge/`. No Android SDK/NDK is
-installed here, so no APK was built or device-tested. Phase 4 adds an Apple
-Silicon Mac target/helper scaffold under `apps/mac/`; it has not been built or
-runtime-verified on this Windows host. Remote screen remains unimplemented.
+**Runtime-verified scope: Windows host ↔ Windows target, driven by the
+two-instance pinned-TLS harness on this host.** Clipboard updates and small
+file transfers now travel between two real backend processes over the existing
+v2 pinned-TLS transport; the UI sends clipboard text and offers/accepts files and
+refreshes on backend notifications. No two *separate physical* PCs were available
+here, so that remains harness-verified rather than field-verified.
+
+Android (`apps/android/`) and the Rust FFI crate (`shared/android-bridge/`) are
+**source-complete but source-only**: no Android SDK/NDK/Gradle is installed, so
+no APK was built and no device was tested. Mac (`apps/mac/`) remains a
+source-only scaffold on this Windows host. Remote screen is unimplemented.
 Builds are **unsigned** until a code-signing certificate is provided.
 
 ## What is included
@@ -22,8 +24,19 @@ Builds are **unsigned** until a code-signing certificate is provided.
 - Rust backend with a versioned binary protocol, LAN (mDNS) discovery, QR /
   six-digit pairing, pinned TLS 1.3 per pair, an adjacency layout model, and
   Windows low-level input capture/injection.
-- A two-instance end-to-end smoke test that links two backend processes over
-  pinned TLS and verifies a cursor crossing is delivered.
+- Two-instance end-to-end tests that link two backend processes over pinned TLS
+  and verify a cursor crossing, exact clipboard text delivery, and exact file
+  bytes (offer → accept → chunks → complete).
+- Pinned outbound connection RPC (`connectPeer`) that requires a verified
+  64-hex SHA-256 fingerprint and rejects a mismatch with stored trust.
+- A self-signed TLS identity generated on first run and persisted in the myMouse
+  config directory. `localIdentity` exposes its public fingerprint and listen
+  port; the private key is never returned over RPC or logged.
+- A pinned inbound listener (`MYMOUSE_PORT`, default 24800) that accepts only a
+  v2 `Hello` from a device already in the trust store with a usable capability;
+  untrusted peers are closed before any clipboard/file/input message is handled.
+- Backend-to-UI notifications for clipboard/file events; the React app refreshes
+  its state when they arrive.
 
 ## Prerequisites
 
@@ -85,6 +98,11 @@ it, it will require your explicit action.
    certificate is rejected before input forwarding is enabled.
 5. Grant only the capabilities you want (input, clipboard, files, screen).
    Capabilities can be revoked later from Device management.
+6. Use **Settings → Show my fingerprint** to read this install's public pairing
+   token and listen port (default 24800, override with `MYMOUSE_PORT`). Exchange
+   fingerprints out of band, then open **Settings → Peer connection** and enter
+   the peer's address, device ID, and *verified* 64-hex fingerprint. There is no
+   unpinned fallback. Discovery → automatic connection is still a manual flow.
 
 ## Control and layout
 
@@ -108,19 +126,19 @@ its capabilities. Revoking removes the pin, so the peer must pair again.
 See [docs/limitations.md](docs/limitations.md). In short:
 
 - No injection into UAC prompts, the secure desktop, or locked sessions.
-- Clipboard/file-transfer state and UI exist, but peer-to-peer delivery is not
-  wired yet; remote screen is not implemented.
+- Clipboard/file delivery is verified between two processes in test mode; no
+  two-physical-PC session was run here. Remote screen is not implemented.
 - Complex keyboard layouts, IMEs, and per-monitor DPI handoff are not complete.
-- The Android app uses a stub bridge and cannot be built or tested here (no
-  Android SDK/NDK); Mac targets cannot be verified on a Windows host.
+- Android is source-only with a real pinned-TLS bridge implementation (no APK
+  or device test: no Android SDK/NDK/Gradle); Mac is source-only on Windows.
 - Builds are unsigned; autostart is off until you enable it.
 
 ## Development layout
 
 ```
 myMouse/
-  apps/android/     Phase 3 Android app scaffold (Kotlin, stub bridge)
-  apps/mac/         Phase 4 Apple Silicon Mac target/helper scaffold (Swift)
+  apps/android/     Android app sources (Kotlin pinned-TLS bridge; source-only)
+  apps/mac/         Apple Silicon Mac target/helper scaffold (Swift)
   electron/         Electron main, preload, JSON-RPC bridge
   src/              React UI
   shared/protocol/  Versioned binary message protocol

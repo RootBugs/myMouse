@@ -9,5 +9,5 @@
         android:layout_height="match_parent"
         android:gravity="center"
         android:padding="24dp"
-        android:text="Remote screen viewer placeholder (LAN).\n\nPhase 3 scaffold: connect to trusted host, request stream, render H.264 frames in SurfaceView/TextureView, and forward touch/key events through the bridge. Real streaming is not implemented in this environment." />
+        android:text="Remote screen video rendering is not implemented in this build. Touch input forwarding requires a paired, pinned host." />
 </FrameLayout>

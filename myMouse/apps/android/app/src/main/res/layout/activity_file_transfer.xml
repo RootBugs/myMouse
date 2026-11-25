@@ -5,8 +5,8 @@
     android:orientation="vertical"
     android:padding="24dp">
     <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/file_transfer" android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall" />
-    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="Scaffold: send/receive UI placeholders. Real transfer uses myMouse protocol over pinned TLS; Android file picker/share integration required for full flow." />
-    <Button android:id="@+id/btnPickSend" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Pick file to send (scaffold)" />
-    <Button android:id="@+id/btnAcceptReceive" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Simulate receive approval (scaffold)" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="Transfers use v2 protocol frames over the paired pinned TLS session. A paired, files-enabled host is required." />
+    <Button android:id="@+id/btnPickSend" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Pick file and offer to host" />
+    <Button android:id="@+id/btnAcceptReceive" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Wait for incoming offer (60 s)" />
     <TextView android:id="@+id/fileStatus" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="No transfer." />
 </LinearLayout>

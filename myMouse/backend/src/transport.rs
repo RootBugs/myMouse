@@ -176,6 +176,51 @@ pub struct PeerStream {
     connected: bool,
 }
 
+async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, message: &Message) -> TransportResult<()> {
+    let payload = mymouse_protocol::encode(message);
+    let length = payload.len() as u32;
+    stream.write_all(&length.to_be_bytes()).await?;
+    stream.write_all(&payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> TransportResult<Message> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME_LEN {
+        return Err("invalid frame length".into());
+    }
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).await?;
+    mymouse_protocol::decode(&payload).map_err(Into::into)
+}
+
+/// Read half of a split peer connection. Kept separate from the writer so a
+/// pending read is never cancelled by an outbound send (which could otherwise
+/// drop part of a length-prefixed frame).
+pub struct PeerReader {
+    inner: tokio::io::ReadHalf<Stream>,
+}
+
+/// Write half of a split peer connection.
+pub struct PeerWriter {
+    inner: tokio::io::WriteHalf<Stream>,
+}
+
+impl PeerReader {
+    pub async fn recv(&mut self) -> TransportResult<Message> {
+        read_frame(&mut self.inner).await
+    }
+}
+
+impl PeerWriter {
+    pub async fn send(&mut self, message: &Message) -> TransportResult<()> {
+        write_frame(&mut self.inner, message).await
+    }
+}
+
 impl PeerStream {
     fn from_client(tls: ClientTlsStream<TcpStream>) -> Self {
         Self {
@@ -195,26 +240,24 @@ impl PeerStream {
         self.connected
     }
 
+    /// Split the pinned-TLS stream into independent read/write halves.
+    pub fn into_split(self) -> (PeerReader, PeerWriter) {
+        let (reader, writer) = tokio::io::split(self.stream);
+        (PeerReader { inner: reader }, PeerWriter { inner: writer })
+    }
+
     pub async fn send(&mut self, message: &Message) -> TransportResult<()> {
-        let payload = mymouse_protocol::encode(message);
-        let length = payload.len() as u32;
-        self.stream.write_all(&length.to_be_bytes()).await?;
-        self.stream.write_all(&payload).await?;
-        self.stream.flush().await?;
-        Ok(())
+        write_frame(&mut self.stream, message).await
     }
 
     pub async fn recv(&mut self) -> TransportResult<Message> {
-        let mut header = [0u8; 4];
-        self.stream.read_exact(&mut header).await?;
-        let length = u32::from_be_bytes(header) as usize;
-        if length == 0 || length > MAX_FRAME_LEN {
-            self.connected = false;
-            return Err("invalid frame length".into());
+        match read_frame(&mut self.stream).await {
+            Ok(message) => Ok(message),
+            Err(error) => {
+                self.connected = false;
+                Err(error)
+            }
         }
-        let mut payload = vec![0u8; length];
-        self.stream.read_exact(&mut payload).await?;
-        mymouse_protocol::decode(&payload).map_err(Into::into)
     }
 }
 
