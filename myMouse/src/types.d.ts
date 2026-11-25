@@ -31,6 +31,14 @@ export interface TransferRecord {
   updated_at_ms: number;
 }
 
+export interface DiscoveredPeer {
+  id: string;
+  name: string;
+  address: string;
+  port: number;
+  fingerprint: string;
+}
+
 declare global {
   interface Window {
     mymouse: {
@@ -52,6 +60,8 @@ declare global {
       offerFile: (path: string, peerDeviceId?: string) => Promise<{ ok: boolean; offer?: unknown; error?: string }>;
       sendClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
       connectPeer: (address: string, peerDeviceId: string, fingerprint: string) => Promise<{ ok: boolean; error?: string }>;
+      discoveredPeers: () => Promise<{ ok: boolean; peers: DiscoveredPeer[] }>;
+      pairDiscovered: (peerId: string) => Promise<{ ok: boolean; error?: string }>;
       localIdentity: () => Promise<{ ok: boolean; deviceId?: string; fingerprint?: string; listenPort?: number; error?: string }>;
 
       onNotification?: (cb: (message: Record<string, unknown>) => void) => () => void;

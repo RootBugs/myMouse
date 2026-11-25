@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('mymouse', {
     ipcRenderer.invoke('mymouse:call', 'sendClipboard', { text }),
   connectPeer: (address: string, peerDeviceId: string, fingerprint: string) =>
     ipcRenderer.invoke('mymouse:call', 'connectPeer', { address, peerDeviceId, fingerprint }),
+  discoveredPeers: () => ipcRenderer.invoke('mymouse:call', 'discoveredPeers'),
+  pairDiscovered: (peerId: string) => ipcRenderer.invoke('mymouse:call', 'pairDiscovered', { peerId }),
   localIdentity: () => ipcRenderer.invoke('mymouse:call', 'localIdentity'),
 
   onNotification: (cb: (message: unknown) => void) => {

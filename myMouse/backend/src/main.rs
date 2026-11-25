@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{timeout, Duration};
 use transport::{ClientPinMap, Server};
-use trust::TrustStore;
+use trust::{Capabilities, TrustStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AppSettings {
@@ -57,6 +57,8 @@ struct AppState {
     listen_port: u16,
     /// Fingerprint → device ID map used by the mutual-TLS listener.
     client_pins: ClientPinMap,
+    /// Latest mDNS peers, keyed by device ID.
+    discovered: Arc<RwLock<HashMap<String, discovery::Peer>>>,
 }
 
 impl AppState {
@@ -83,6 +85,7 @@ impl AppState {
             identity_fingerprint: String::new(),
             listen_port: 0,
             client_pins: Arc::new(RwLock::new(HashMap::new())),
+            discovered: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -223,6 +226,68 @@ async fn handle_request(
                 .map(|(id, caps)| json!({ "id": id, "name": id, "capabilities": caps }))
                 .collect();
             rpc_ok(id, json!(devices));
+        }
+        "discoveredPeers" => {
+            let st = state.lock().unwrap();
+            let peers: Vec<Value> = match st.discovered.read() {
+                Ok(map) => map
+                    .values()
+                    .map(|peer| {
+                        json!({
+                            "id": peer.id,
+                            "name": peer.name,
+                            "address": peer.address,
+                            "port": peer.port,
+                            "fingerprint": peer.fingerprint,
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            rpc_ok(id, json!({ "ok": true, "peers": peers }));
+        }
+        "pairDiscovered" => {
+            let peer_id = params.get("peerId").and_then(Value::as_str).unwrap_or("");
+            let (address, port, fingerprint) = {
+                let st = state.lock().unwrap();
+                match st.discovered.read().ok().and_then(|map| map.get(peer_id).cloned()) {
+                    Some(peer) => (peer.address, peer.port, peer.fingerprint),
+                    None => {
+                        return rpc_err(id, "peer was not discovered");
+                    }
+                }
+            };
+            if !is_hex_fingerprint(&fingerprint) {
+                return rpc_err(id, "discovered peer has no valid fingerprint");
+            }
+            let Ok(socket_addr) = format!("{address}:{port}").parse::<SocketAddr>() else {
+                return rpc_err(id, "discovered peer has no valid address");
+            };
+            {
+                let mut st = state.lock().unwrap();
+                st.trust.grant(
+                    peer_id,
+                    Capabilities {
+                        input: true,
+                        clipboard: true,
+                        files: true,
+                        screen: false,
+                    },
+                );
+                st.trust.set_fingerprint(peer_id, fingerprint.clone());
+                let trust_path = st.config_dir.join("trust.json");
+                let _ = st.trust.save(trust_path);
+                if let Ok(mut pins) = st.client_pins.write() {
+                    pins.insert(fingerprint.clone(), peer_id.to_string());
+                };
+            }
+            match network
+                .connect(socket_addr, fingerprint, peer_id.to_string())
+                .await
+            {
+                Ok(()) => rpc_ok(id, json!({ "ok": true })),
+                Err(error) => rpc_err(id, &error),
+            }
         }
         "connectPeer" => {
             let address = params.get("address").and_then(Value::as_str).unwrap_or("");
@@ -476,7 +541,7 @@ async fn run_ipc() {
     let config = config_dir();
     let state = Arc::new(Mutex::new(AppState::new(config.clone())));
     let device_id = state.lock().unwrap().device_id.clone();
-    let network = network::start(state.clone(), device_id, String::new(), true);
+    let network = network::start(state.clone(), device_id.clone(), String::new(), true);
 
     // Production identity is generated once and reused; its fingerprint is the
     // public pairing token. The private key never leaves the config directory.
@@ -514,14 +579,41 @@ async fn run_ipc() {
     .await
     {
         Ok(server) => {
+            let listen_port = server.local_addr().port();
             {
                 let mut st = state.lock().unwrap();
                 st.identity_fingerprint = identity.fingerprint().to_string();
-                st.listen_port = server.local_addr().port();
+                st.listen_port = listen_port;
             }
             let listener_state = state.clone();
             let listener_network = network.clone();
             tokio::spawn(accept_inbound_loop(server, listener_state, listener_network));
+
+            // Advertise the real listener and fingerprint over mDNS, then keep
+            // a live peer list for the pairing UI.
+            if let Ok(mut discovered) =
+                discovery::Discovery::new(&device_id, &device_id).start(listen_port, identity.fingerprint())
+            {
+                let discovery_state = state.clone();
+                tokio::spawn(async move {
+                    while let Some(peer) = discovered.recv().await {
+                        {
+                            let st = discovery_state.lock().unwrap();
+                            if let Ok(mut map) = st.discovered.write() {
+                                map.insert(peer.id.clone(), peer.clone());
+                            };
+                        }
+                        emit(json!({
+                            "notification": "discoveredPeer",
+                            "id": peer.id,
+                            "name": peer.name,
+                            "address": peer.address,
+                            "port": peer.port,
+                            "fingerprint": peer.fingerprint,
+                        }));
+                    }
+                });
+            }
         }
         Err(error) => {
             eprintln!("mymouse: could not bind pinned TLS listener: {error}");

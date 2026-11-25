@@ -84,3 +84,21 @@ android-bridge tests, frontend tests, typecheck/build, Windows packaging and
 artifact verification must all pass on this host. Anything requiring a second
 physical PC, an Android device, or macOS must be listed as unverified, not
 reported as working.
+
+## Follow-up: discovery → pairing → auto-connect (2026-11-25)
+
+Later backend work replaces the fixed discovery port 45552 with an mDNS
+advertisement of the real TLS listener (default 24800, configurable via
+`MYMOUSE_PORT`) and the local certificate fingerprint in TXT records `port` and
+`fp` on `_mymouse._tcp.local.`. `discoveredPeers` returns discovered peers
+(id/name/address/port/fingerprint) and a `discoveredPeer` notification is
+emitted when one is found. `pairDiscovered { peerId }` is an explicit approval:
+it pins the advertised fingerprint for that device ID, saves `trust.json`,
+updates the inbound mutual-TLS client-pin map, and connects. Mutual TLS is
+unchanged in principle: discovery alone never grants trust, both peers must
+approve each other, and an inbound peer cannot connect unless its certificate is
+pinned for the exact device ID in its v2 `Hello`.
+
+This flow is implemented in the backend and covered by unit/integration tests;
+it has **not** been verified on real two-PC/tablet hardware. The earlier
+non-goals and platform limitations above still apply.

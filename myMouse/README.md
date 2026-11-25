@@ -21,14 +21,21 @@ Builds are **unsigned** until a code-signing certificate is provided.
 
 - Electron + React desktop UI with a device dashboard, adjacency layout editor,
   and device-management panel.
-- Rust backend with a versioned binary protocol, LAN (mDNS) discovery, QR /
-  six-digit pairing, pinned TLS 1.3 per pair, an adjacency layout model, and
-  Windows low-level input capture/injection.
+- Rust backend with a versioned binary protocol, LAN (mDNS) discovery that
+  advertises the real TLS listener port and certificate fingerprint, QR /
+  six-digit or discovery-based `pairDiscovered` approval, pinned TLS 1.3 per
+  pair, an adjacency layout model, and Windows low-level input capture/
+  injection.
 - Two-instance end-to-end tests that link two backend processes over pinned TLS
   and verify a cursor crossing, exact clipboard text delivery, and exact file
   bytes (offer → accept → chunks → complete).
 - Pinned outbound connection RPC (`connectPeer`) that requires a verified
   64-hex SHA-256 fingerprint and rejects a mismatch with stored trust.
+- Discovery-backed pairing RPCs: `discoveredPeers` lists nearby peers (id, name,
+  address, port, fingerprint), a `discoveredPeer` notification is emitted when a
+  peer is found, and `pairDiscovered { peerId }` explicitly approves a peer,
+  pins its advertised fingerprint, saves `trust.json`, updates the inbound
+  mutual-TLS client-pin map, and connects. Discovery alone never grants trust.
 - A self-signed TLS identity generated on first run and persisted in the myMouse
   config directory. `localIdentity` exposes its public fingerprint and listen
   port; the private key is never returned over RPC or logged.
@@ -99,11 +106,26 @@ it, it will require your explicit action.
    certificate is rejected before input forwarding is enabled.
 5. Grant only the capabilities you want (input, clipboard, files, screen).
    Capabilities can be revoked later from Device management.
-6. Use **Settings → Show my fingerprint** to read this install's public pairing
-   token and listen port (default 24800, override with `MYMOUSE_PORT`). Exchange
-   fingerprints out of band, then open **Settings → Peer connection** and enter
-   the peer's address, device ID, and *verified* 64-hex fingerprint. There is no
-   unpinned fallback. Discovery → automatic connection is still a manual flow.
+6. To pair via discovery, keep both installs on the same LAN. The backend
+   advertises over mDNS (`_mymouse._tcp.local.`) the **real TLS listener port**
+   (default 24800, configurable with `MYMOUSE_PORT`; the old fixed discovery port
+   45552 is gone) and the local certificate fingerprint as TXT records `port` and
+   `fp`. The `discoveredPeers` RPC returns each discovered peer's id, name,
+   address, port, and fingerprint; a `discoveredPeer` notification is emitted
+   when a peer is found.
+7. Explicitly approve the discovered peer on **each** machine with
+   `pairDiscovered { "peerId": "..." }`. The backend pins the advertised
+   fingerprint for that device ID, saves `trust.json`, updates the inbound
+   mutual-TLS client-pin map, and connects. Discovery alone never grants trust
+   or connects: a peer cannot connect inbound unless its certificate is pinned
+   for the exact device ID in its v2 `Hello`.
+8. For a manual/verification path, **Settings → Show my fingerprint** still
+   exposes this install's public fingerprint and listen port, and **Settings →
+   Peer connection** (`connectPeer`) accepts the peer's address, device ID, and
+   *verified* 64-hex fingerprint. There is no unpinned fallback. The discovery →
+   pairing → auto-connect flow is implemented in the backend and covered by
+   unit/integration tests here, but has not been verified between real physical
+   PCs or a tablet.
 
 ## Control and layout
 
@@ -118,9 +140,10 @@ it, it will require your explicit action.
 
 ## Trust management
 
-Paired devices, capability grants, and pinned fingerprints are stored in the
-per-user config directory. Use Device management to revoke a device or change
-its capabilities. Revoking removes the pin, so the peer must pair again.
+Paired devices, capability grants, and pinned fingerprints (including those
+pinned by `pairDiscovered`) are stored in `trust.json` in the per-user config
+directory. Use Device management to revoke a device or change its capabilities.
+Revoking removes the pin, so the peer must pair again.
 
 ## Known limitations
 
@@ -128,7 +151,10 @@ See [docs/limitations.md](docs/limitations.md). In short:
 
 - No injection into UAC prompts, the secure desktop, or locked sessions.
 - Clipboard/file delivery is verified between two processes in test mode; no
-  two-physical-PC session was run here. Remote screen is not implemented.
+  two-physical-PC session was run here. Discovery → pairing → auto-connect is
+  implemented and unit/integration tested, but not verified on real hardware;
+  pairing still requires explicit approval on both peers. Remote screen is not
+  implemented.
 - Complex keyboard layouts, IMEs, and per-monitor DPI handoff are not complete.
 - Android is source-only with a real pinned-TLS bridge implementation (no APK
   or device test: no Android SDK/NDK/Gradle); Mac is source-only on Windows.
