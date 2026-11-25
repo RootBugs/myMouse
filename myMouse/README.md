@@ -32,9 +32,10 @@ Builds are **unsigned** until a code-signing certificate is provided.
 - A self-signed TLS identity generated on first run and persisted in the myMouse
   config directory. `localIdentity` exposes its public fingerprint and listen
   port; the private key is never returned over RPC or logged.
-- A pinned inbound listener (`MYMOUSE_PORT`, default 24800) that accepts only a
-  v2 `Hello` from a device already in the trust store with a usable capability;
-  untrusted peers are closed before any clipboard/file/input message is handled.
+- A pinned inbound listener (`MYMOUSE_PORT`, default 24800) using mutual TLS:
+  the client must present the certificate pinned for a trusted device, and its
+  v2 `Hello` device ID must match that certificate. Untrusted peers are closed
+  before any clipboard/file/input message is handled.
 - Backend-to-UI notifications for clipboard/file events; the React app refreshes
   its state when they arrive.
 

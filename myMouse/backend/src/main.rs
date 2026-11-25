@@ -17,13 +17,14 @@ use mymouse_protocol::{ClipboardKind, Message, PROTOCOL_VERSION};
 use network::PeerRuntimeHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{timeout, Duration};
-use transport::Server;
+use transport::{ClientPinMap, Server};
 use trust::TrustStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -54,6 +55,8 @@ struct AppState {
     /// Pairing token for this install, filled in when production starts.
     identity_fingerprint: String,
     listen_port: u16,
+    /// Fingerprint → device ID map used by the mutual-TLS listener.
+    client_pins: ClientPinMap,
 }
 
 impl AppState {
@@ -79,6 +82,7 @@ impl AppState {
             config_dir,
             identity_fingerprint: String::new(),
             listen_port: 0,
+            client_pins: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -242,11 +246,20 @@ async fn handle_request(
             let Ok(address) = address.parse::<SocketAddr>() else {
                 return rpc_err(id, "address must be host:port");
             };
-            match network
-                .connect(address, fingerprint.to_ascii_lowercase(), peer_id)
-                .await
-            {
-                Ok(()) => rpc_ok(id, json!({ "ok": true })),
+            let pinned = fingerprint.to_ascii_lowercase();
+            match network.connect(address, pinned.clone(), peer_id.clone()).await {
+                Ok(()) => {
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.trust.set_fingerprint(&peer_id, pinned.clone());
+                        if let Ok(mut pins) = st.client_pins.write() {
+                            pins.insert(pinned, peer_id.clone());
+                        }
+                        let trust_path = st.config_dir.join("trust.json");
+                        let _ = st.trust.save(trust_path);
+                    }
+                    rpc_ok(id, json!({ "ok": true }))
+                }
                 Err(error) => rpc_err(id, &error),
             }
         }
@@ -370,9 +383,14 @@ async fn handle_request(
 }
 
 /// A peer must announce itself with a v2 `Hello` naming a device already in
-/// the trust store with at least one usable capability. Anything else is
+/// the trust store with at least one usable capability, and must present the
+/// client certificate pinned for that exact device ID. Anything else is
 /// dropped before the stream reaches the message dispatcher.
-fn authorize_inbound_hello(state: &Arc<Mutex<AppState>>, message: &Message) -> Option<String> {
+fn authorize_inbound_hello(
+    state: &Arc<Mutex<AppState>>,
+    message: &Message,
+    peer_fingerprint: Option<&str>,
+) -> Option<String> {
     let Message::Hello {
         version,
         device_id,
@@ -393,7 +411,13 @@ fn authorize_inbound_hello(state: &Arc<Mutex<AppState>>, message: &Message) -> O
         .capabilities(device_id)
         .map(|cap| cap.input || cap.clipboard || cap.files)
         .unwrap_or(false);
-    usable.then(|| device_id.clone())
+    let certificate_matches = st
+        .trust
+        .fingerprint(device_id)
+        .zip(peer_fingerprint)
+        .map(|(pinned, presented)| pinned.eq_ignore_ascii_case(presented))
+        .unwrap_or(false);
+    (usable && certificate_matches).then(|| device_id.clone())
 }
 
 /// Handshake gate for production inbound peers. TLS is already pinned by the
@@ -412,8 +436,9 @@ async fn accept_inbound_loop(
                 break;
             }
         };
+        let presented = stream.peer_fingerprint().map(str::to_string);
         let peer_id = match timeout(Duration::from_secs(5), stream.recv()).await {
-            Ok(Ok(message)) => authorize_inbound_hello(&state, &message),
+            Ok(Ok(message)) => authorize_inbound_hello(&state, &message, presented.as_deref()),
             Ok(Err(error)) => {
                 emit(json!({
                     "notification": "inboundRejected",
@@ -462,14 +487,29 @@ async fn run_ipc() {
             return;
         }
     };
+    network.set_identity(Arc::new(identity.clone()));
+    let pins: ClientPinMap = Arc::new(RwLock::new(
+        state
+            .lock()
+            .unwrap()
+            .trust
+            .fingerprint_map()
+            .into_iter()
+            .collect(),
+    ));
+    {
+        let mut st = state.lock().unwrap();
+        st.client_pins = pins.clone();
+    }
     let port = std::env::var("MYMOUSE_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(24800);
-    match Server::bind(
+    match Server::bind_pinned(
         &format!("0.0.0.0:{port}"),
         identity.cert_der.clone(),
         identity.key_der.clone(),
+        pins,
     )
     .await
     {
@@ -545,15 +585,36 @@ mod tests {
     fn inbound_hello_requires_trust_and_supported_version() {
         let mut state = AppState::with_device_id(std::env::temp_dir(), "local-pc".to_string());
         state.trust.grant("pc-b", Capabilities::default());
+        let pin = "c".repeat(64);
+        state.trust.set_fingerprint("pc-b", pin.clone());
         let state = Arc::new(Mutex::new(state));
 
         assert_eq!(
-            authorize_inbound_hello(&state, &hello(PROTOCOL_VERSION, "pc-b")),
+            authorize_inbound_hello(
+                &state,
+                &hello(PROTOCOL_VERSION, "pc-b"),
+                Some(pin.as_str())
+            ),
             Some("pc-b".to_string())
         );
-        assert_eq!(authorize_inbound_hello(&state, &hello(999, "pc-b")), None);
         assert_eq!(
-            authorize_inbound_hello(&state, &hello(PROTOCOL_VERSION, "stranger")),
+            authorize_inbound_hello(&state, &hello(999, "pc-b"), Some(pin.as_str())),
+            None
+        );
+        assert_eq!(
+            authorize_inbound_hello(
+                &state,
+                &hello(PROTOCOL_VERSION, "pc-b"),
+                Some(&"d".repeat(64))
+            ),
+            None
+        );
+        assert_eq!(
+            authorize_inbound_hello(&state, &hello(PROTOCOL_VERSION, "pc-b"), None),
+            None
+        );
+        assert_eq!(
+            authorize_inbound_hello(&state, &hello(PROTOCOL_VERSION, "stranger"), Some(&pin)),
             None
         );
         assert_eq!(
@@ -567,7 +628,8 @@ mod tests {
                     mime: None,
                     timestamp_ms: 1,
                     seq: 1,
-                })
+                }),
+                Some(pin.as_str())
             ),
             None
         );

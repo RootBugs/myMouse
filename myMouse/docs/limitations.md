@@ -54,10 +54,10 @@ Last accuracy pass: 2026-11-25. Scope statements below distinguish what was
   listener is pinned TLS and requires a v2 `Hello` naming a trusted device with
   a usable capability; untrusted peers are closed before any application data
   is dispatched. Discovery to automatic connection is still a manual flow.
-- Inbound peer identity is asserted by the `Hello` device ID plus the local
-  trust store; the TLS listener does not request a client certificate. A peer
-  that already knows a trusted device ID could impersonate it. Mutual
-  client-certificate pinning is a remaining hardening task.
+- Inbound peer identity is bound to the certificate pinned for a trusted device:
+  the TLS listener requires a client certificate and the v2 `Hello` device ID
+  must match that certificate's pin. A peer cannot impersonate a trusted device
+  merely by knowing its ID.
 - Discovery is LAN-first (mDNS). First run may require a Windows Firewall allow
   prompt.
 - **Launch at Windows start is off by default and stays off until you explicitly

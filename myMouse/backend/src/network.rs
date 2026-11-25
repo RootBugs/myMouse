@@ -7,6 +7,7 @@
 
 use crate::clipboard;
 use crate::file_transfer::TransferRecord;
+use crate::identity::Identity;
 use crate::input::{CapturedEvent, InputBridge};
 use crate::transport::{Client, PeerStream};
 use crate::{emit, AppState};
@@ -60,9 +61,17 @@ enum RuntimeCommand {
 #[derive(Clone)]
 pub struct PeerRuntimeHandle {
     commands: mpsc::UnboundedSender<RuntimeCommand>,
+    /// Cloneable slot for this install's TLS identity, used by mutual-TLS
+    /// outbound connections. Test mode never sets it.
+    identity: Arc<Mutex<Option<Arc<Identity>>>>,
 }
 
 impl PeerRuntimeHandle {
+    /// Install this install's TLS identity for outbound mutual-TLS handshakes.
+    pub fn set_identity(&self, identity: Arc<Identity>) {
+        *self.identity.lock().unwrap() = Some(identity);
+    }
+
     /// Queue a message for the connected peer. The ack resolves after the
     /// framed write completes, so callers keep the same error semantics as a
     /// direct `PeerStream::send`.
@@ -131,7 +140,13 @@ impl PeerRuntimeHandle {
         fingerprint: String,
         peer_device_id: String,
     ) -> Result<(), String> {
-        let stream = Client::connect(address, &[fingerprint])
+        let identity = self
+            .identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|id| (id.cert_der.clone(), id.key_der.clone()));
+        let stream = Client::connect_with_identity(address, &[fingerprint], identity)
             .await
             .map_err(|error| error.to_string())?;
         self.attach_outbound(stream, peer_device_id).await
@@ -167,6 +182,7 @@ impl PeerRuntime {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let handle = PeerRuntimeHandle {
             commands: command_sender.clone(),
+            identity: Arc::new(Mutex::new(None)),
         };
         tokio::spawn(async move {
             let mut runtime = Self {

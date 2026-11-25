@@ -14,6 +14,7 @@ use std::path::Path;
 const CERT_FILE: &str = "tls_cert.der";
 const KEY_FILE: &str = "tls_key.der";
 
+#[derive(Clone)]
 pub struct Identity {
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,

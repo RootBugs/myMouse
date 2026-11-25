@@ -99,6 +99,14 @@ impl TrustStore {
             .get(&sanitize_id(id))
             .and_then(|d| d.fingerprint.as_deref())
     }
+
+    /// All pinned device/fingerprint pairs, for configuring mutual TLS.
+    pub fn fingerprint_map(&self) -> Vec<(String, String)> {
+        self.devices
+            .iter()
+            .filter_map(|(id, device)| device.fingerprint.as_ref().map(|fp| (id.clone(), fp.clone())))
+            .collect()
+    }
 }
 
 #[cfg(test)]
