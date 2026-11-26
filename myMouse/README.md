@@ -12,10 +12,13 @@ refreshes on backend notifications. No two *separate physical* PCs were availabl
 here, so that remains harness-verified rather than field-verified.
 
 Android (`apps/android/`) and the Rust FFI crate (`shared/android-bridge/`) are
-**source-complete but source-only**: no Android SDK/NDK/Gradle is installed, so
-no APK was built and no device was tested. Mac (`apps/mac/`) remains a
-source-only scaffold on this Windows host. Remote screen is unimplemented.
-Builds are **unsigned** until a code-signing certificate is provided.
+**Phase 3 scaffolds / source-complete but source-only**: no Android SDK/NDK/Gradle
+is installed on this Windows host, so no APK was built and no emulator/device
+test was run. See [`apps/android/README.md`](apps/android/README.md) for build
+steps, Gradle tasks, permissions, and emulator smoke test instructions.
+Mac (`apps/mac/`) remains a source-only scaffold on this Windows host. Remote
+screen is unimplemented. Builds are **unsigned** until a code-signing certificate
+is provided.
 
 ## What is included
 

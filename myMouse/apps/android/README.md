@@ -70,13 +70,33 @@ Accessibility APIs cannot synthesize raw keys.
   authorization, clears pending gesture state and closes the socket. Clearing
   requires the explicit **Re-enable input** button.
 
-## What to verify on a real device/emulator
+## Gradle tasks (not run in this environment)
 
-1. `./gradlew assembleDebug` with Android SDK 35 installed (not run here).
-2. Pair against a Windows host and confirm `PairApprove` is required before a
-   trust entry is stored.
-3. Confirm a wrong certificate is rejected by the pin check.
-4. Inject a tap/swipe with Accessibility enabled and confirm the panic button
-   stops injection immediately.
-5. Send and receive a file; verify SHA-256 and saved path.
-6. Verify QR scanning and deep-link handling with camera permission.
+Android SDK/NDK/Gradle were not installed on this Windows host. `gradlew.bat` is a placeholder; run `gradle wrapper` on a machine with Gradle, or install the wrapper JAR, before using the wrapper.
+
+```powershell
+# From myMouse/apps/android
+gradle wrapper                 # generate wrapper jar if missing
+.\gradlew.bat :app:assembleDebug
+.\gradlew.bat :app:lintDebug
+.\gradlew.bat :app:testDebugUnitTest
+.\gradlew.bat :app:connectedDebugAndroidTest  # requires emulator/device
+```
+
+## Emulator smoke test (not run here)
+
+No emulator/device was available. On a machine with Android SDK + emulator:
+
+1. Create/start an emulator (API 26+; API 35 recommended): `avdmanager create ...` / `emulator -avd <name>`.
+2. Build and install: `.\gradlew.bat :app:installDebug`.
+3. Launch app and confirm MainActivity renders and navigation buttons open Pairing, Trusted devices, File transfer, Remote screen, and Settings.
+4. In Settings, open Accessibility settings and confirm the myMouse service is listed; enable it only for testing.
+5. Pairing flow: enter a 6-digit code and host id; confirm the UI requires explicit approval before storing a trusted device.
+6. QR flow: scan a `mymouse://pair?code=123456&id=host1` QR and confirm fields populate.
+7. File transfer: pick a file and confirm scaffold status message; real transfer requires a paired pinned host.
+8. Remote screen: confirm placeholder clearly states streaming is not implemented.
+9. Capture `adb logcat` and screenshot for evidence. Do **not** claim device verification without this run.
+
+## Real device verification required
+
+Before calling Phase 3 shipped: build APK on SDK-equipped machine, run emulator smoke test, then verify on a real Android device with a real Windows host (pairing, pinned TLS rejection, input injection, panic disable, file transfer, QR scan).

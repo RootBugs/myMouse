@@ -39,10 +39,13 @@ Last accuracy pass: 2026-11-26. Scope statements below distinguish what was
   discovery → pairing → auto-connect flow is implemented in the backend and
   covered by unit/integration tests, but there was no real two-PC/tablet field
   verification of mDNS discovery, pairing, or the subsequent connection.
-- Android: the app sources use the project's v2 framing and pinned-TLS rules;
-  no APK was built and no device test was run because Android SDK/NDK/Gradle
-  are unavailable on this Windows host. Treat all Android behaviour as
-  source-only until built and exercised on a device.
+- Android (Phase 3 scaffold): app sources in `apps/android/` and Rust FFI bridge in
+  `shared/android-bridge/` implement pairing, trust storage, accessibility service
+  scaffolding, notification helper, file transfer UI, remote screen placeholder,
+  settings, and v2 pinned-TLS/wire contracts. No APK was built and no
+  emulator/device test was run because Android SDK/NDK/Gradle are unavailable on
+  this Windows host. Treat all Android behaviour as source-only until built and
+  exercised on a device/emulator.
 - Apple Silicon Mac target/helper in `apps/mac/` is a **source-only scaffold**
   on this Windows host: no `swift build` or runtime verification, no macOS
   permission prompts, no ScreenCaptureKit capture, no pinned transport interop,
