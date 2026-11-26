@@ -196,6 +196,17 @@ fn is_hex_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Production peers announce themselves on every outbound connection so the
+/// remote listener's trust gate can identify them before dispatching data.
+fn hello_message(state: &Arc<Mutex<AppState>>) -> Message {
+    let st = state.lock().unwrap();
+    Message::Hello {
+        version: PROTOCOL_VERSION,
+        device_id: st.device_id.clone(),
+        name: st.device_id.clone(),
+    }
+}
+
 async fn handle_request(
     state: &Arc<Mutex<AppState>>,
     network: &PeerRuntimeHandle,
@@ -305,6 +316,11 @@ async fn handle_request(
                 .await
             {
                 Ok(()) => {
+                    // The remote listener is gated: it will not dispatch any
+                    // application data until it sees our trusted Hello.
+                    if let Err(error) = network.send(hello_message(state)).await {
+                        return rpc_err(id, &format!("peer rejected handshake: {error}"));
+                    }
                     {
                         let mut st = state.lock().unwrap();
                         st.trust.grant_if_absent(
@@ -356,6 +372,11 @@ async fn handle_request(
             let pinned = fingerprint.to_ascii_lowercase();
             match network.connect(address, pinned.clone(), peer_id.clone()).await {
                 Ok(()) => {
+                    // Pinning authenticates the TLS peer; the Hello carries our
+                    // device identity through the remote trust gate.
+                    if let Err(error) = network.send(hello_message(state)).await {
+                        return rpc_err(id, &format!("peer rejected handshake: {error}"));
+                    }
                     {
                         let mut st = state.lock().unwrap();
                         st.trust.grant_if_absent(
@@ -652,11 +673,7 @@ fn authorize_inbound_hello(
     if !st.trust.is_trusted(device_id) {
         return None;
     }
-    let usable = st
-        .trust
-        .capabilities(device_id)
-        .map(|cap| cap.input || cap.clipboard || cap.files)
-        .unwrap_or(false);
+    let usable = st.trust.allows_peer(device_id);
     let certificate_matches = st
         .trust
         .fingerprint(device_id)
@@ -666,9 +683,26 @@ fn authorize_inbound_hello(
     (usable && certificate_matches).then(|| device_id.clone())
 }
 
-/// Handshake gate for production inbound peers. TLS is already pinned by the
-/// transport; this adds an identity/capability check before any application
-/// message (clipboard, files, input) is dispatched.
+/// Handshake gate for a single production inbound stream. TLS is already
+/// pinned by the transport; this reads the peer's first frame, requires a v2
+/// Hello, and checks that the named device is trusted, usable and owns the
+/// client certificate that was presented. On any failure the stream is dropped
+/// here, before it can reach the message dispatcher.
+async fn gate_inbound_stream(
+    state: &Arc<Mutex<AppState>>,
+    stream: &mut transport::PeerStream,
+) -> Result<String, String> {
+    let presented = stream.peer_fingerprint().map(str::to_string);
+    let message = timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .map_err(|_| "handshake timed out".to_string())?
+        .map_err(|error| format!("handshake failed: {error}"))?;
+    authorize_inbound_hello(state, &message, presented.as_deref())
+        .ok_or_else(|| "untrusted peer".to_string())
+}
+
+/// Accept pinned inbound peers without blocking the accept loop on a slow or
+/// hostile handshake. Each gate has a five-second deadline.
 async fn accept_inbound_loop(
     server: Server,
     state: Arc<Mutex<AppState>>,
@@ -682,43 +716,32 @@ async fn accept_inbound_loop(
                 break;
             }
         };
-        let presented = stream.peer_fingerprint().map(str::to_string);
-        let peer_id = match timeout(Duration::from_secs(5), stream.recv()).await {
-            Ok(Ok(message)) => authorize_inbound_hello(&state, &message, presented.as_deref()),
-            Ok(Err(error)) => {
-                emit(json!({
-                    "notification": "inboundRejected",
-                    "reason": format!("handshake failed: {error}"),
-                }));
-                None
-            }
-            Err(_) => {
-                emit(json!({
-                    "notification": "inboundRejected",
-                    "reason": "handshake timed out",
-                }));
-                None
-            }
-        };
-        let Some(peer_id) = peer_id else {
+        let gate_state = state.clone();
+        let gate_network = network.clone();
+        tokio::spawn(async move {
+            let peer_id = match gate_inbound_stream(&gate_state, &mut stream).await {
+                Ok(peer_id) => peer_id,
+                Err(reason) => {
+                    emit(json!({ "notification": "inboundRejected", "reason": reason }));
+                    return;
+                }
+            };
             emit(json!({
-                "notification": "inboundRejected",
-                "reason": "untrusted peer",
+                "notification": "inboundPeer",
+                "deviceId": peer_id,
+                "message": "trusted peer attached",
             }));
-            continue;
-        };
-        emit(json!({
-            "notification": "inboundPeer",
-            "deviceId": peer_id,
-            "message": "trusted peer attached",
-        }));
-        if network.attach_inbound(stream, peer_id).await.is_err() {
-            break;
-        }
+            if gate_network.attach_inbound(stream, peer_id).await.is_err() {
+                emit(json!({
+                    "notification": "listener-error",
+                    "error": "network runtime stopped",
+                }));
+            }
+        });
     }
 }
 
-async fn run_ipc() {
+async fn run_ipc() -> Result<(), String> {
     let config = config_dir();
     let state = Arc::new(Mutex::new(AppState::new(config.clone())));
     let device_id = state.lock().unwrap().device_id.clone();
@@ -761,13 +784,8 @@ async fn run_ipc() {
 
     // Production identity is generated once and reused; its fingerprint is the
     // public pairing token. The private key never leaves the config directory.
-    let identity = match Identity::load_or_create(&config) {
-        Ok(identity) => identity,
-        Err(error) => {
-            eprintln!("mymouse: could not load TLS identity: {error}");
-            return;
-        }
-    };
+    let identity = Identity::load_or_create(&config)
+        .map_err(|error| format!("could not load TLS identity: {error}"))?;
     network.set_identity(Arc::new(identity.clone()));
     let pins: ClientPinMap = Arc::new(RwLock::new(
         state
@@ -786,56 +804,48 @@ async fn run_ipc() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(24800);
-    match Server::bind_pinned(
+    let server = Server::bind_pinned(
         &format!("0.0.0.0:{port}"),
         identity.cert_der.clone(),
         identity.key_der.clone(),
         pins,
     )
     .await
+    .map_err(|error| format!("could not bind pinned TLS listener on port {port}: {error}"))?;
+    let listen_port = server.local_addr().port();
     {
-        Ok(server) => {
-            let listen_port = server.local_addr().port();
-            {
-                let mut st = state.lock().unwrap();
-                st.identity_fingerprint = identity.fingerprint().to_string();
-                st.listen_port = listen_port;
-            }
-            let listener_state = state.clone();
-            let listener_network = network.clone();
-            tokio::spawn(accept_inbound_loop(server, listener_state, listener_network));
+        let mut st = state.lock().unwrap();
+        st.identity_fingerprint = identity.fingerprint().to_string();
+        st.listen_port = listen_port;
+    }
+    let listener_state = state.clone();
+    let listener_network = network.clone();
+    tokio::spawn(accept_inbound_loop(server, listener_state, listener_network));
 
-            // Advertise the real listener and fingerprint over mDNS, then keep
-            // a live peer list for the pairing UI.
-            if let Ok(mut discovered) =
-                discovery::Discovery::new(&device_id, &device_id).start(listen_port, identity.fingerprint())
-            {
-                let discovery_state = state.clone();
-                tokio::spawn(async move {
-                    while let Some(peer) = discovered.recv().await {
-                        {
-                            let st = discovery_state.lock().unwrap();
-                            if let Ok(mut map) = st.discovered.write() {
-                                map.insert(peer.id.clone(), peer.clone());
-                            };
-                        }
-                        emit(json!({
-                            "notification": "discoveredPeer",
-                            "id": peer.id,
-                            "name": peer.name,
-                            "address": peer.address,
-                            "port": peer.port,
-                            "fingerprint": peer.fingerprint,
-                        }));
-                    }
-                });
+    // Advertising the real listener and fingerprint over mDNS gives the UI a
+    // peer to pair with; the fingerprint still requires out-of-band approval.
+    if let Ok(mut discovered) =
+        discovery::Discovery::new(&device_id, &device_id).start(listen_port, identity.fingerprint())
+    {
+        let discovery_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(peer) = discovered.recv().await {
+                {
+                    let st = discovery_state.lock().unwrap();
+                    if let Ok(mut map) = st.discovered.write() {
+                        map.insert(peer.id.clone(), peer.clone());
+                    };
+                }
+                emit(json!({
+                    "notification": "discoveredPeer",
+                    "id": peer.id,
+                    "name": peer.name,
+                    "address": peer.address,
+                    "port": peer.port,
+                    "fingerprint": peer.fingerprint,
+                }));
             }
-        }
-        Err(error) => {
-            eprintln!("mymouse: could not bind pinned TLS listener: {error}");
-            let mut st = state.lock().unwrap();
-            st.identity_fingerprint = identity.fingerprint().to_string();
-        }
+        });
     }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -850,6 +860,7 @@ async fn run_ipc() {
         handle_request(&state, &network, id, &request).await;
     }
     network.shutdown();
+    Ok(())
 }
 
 #[tokio::main]

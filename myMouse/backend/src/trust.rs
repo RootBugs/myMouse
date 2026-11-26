@@ -109,6 +109,15 @@ impl TrustStore {
         self.devices.get(id).map(|d| &d.capabilities)
     }
 
+    /// A peer may open an application session only if it is explicitly trusted
+    /// for at least one capability this runtime dispatches. A `screen`-only
+    /// grant is intentionally not enough.
+    pub fn allows_peer(&self, id: &str) -> bool {
+        self.capabilities(id)
+            .map(|caps| caps.input || caps.clipboard || caps.files)
+            .unwrap_or(false)
+    }
+
     pub fn set_capabilities(&mut self, id: &str, capabilities: Capabilities) -> bool {
         let Some(device) = self.devices.get_mut(id) else {
             return false;
