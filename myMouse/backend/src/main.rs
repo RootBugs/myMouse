@@ -765,7 +765,15 @@ async fn run_ipc() -> Result<(), String> {
             }
         }
     });
-    let bridge = Arc::new(Mutex::new(InputBridge::with_sender(&device_id, input_tx)));
+    let gate_network = network.clone();
+    let bridge = Arc::new(Mutex::new(InputBridge::with_connection_gate(
+        &device_id,
+        input_tx,
+        Arc::new(move || gate_network.connected_now()),
+    )));
+    // Forwarding stays armed, but the hooks only swallow local input once a
+    // peer is actually connected. On a fresh install with no peer, input must
+    // keep working on this machine.
     bridge.lock().unwrap().forwarding = true;
     {
         let mut st = state.lock().unwrap();

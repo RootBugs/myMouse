@@ -130,6 +130,9 @@ pub struct PeerRuntimeHandle {
     /// Emergency stop shared with the RPC layer. Injection is blocked while
     /// false even if a trusted peer is still attached.
     input_gate: Arc<AtomicBool>,
+    /// Synchronous mirror of the connection table for the OS input hook: local
+    /// events are only swallowed when there is actually a peer to send to.
+    peer_connected: Arc<AtomicBool>,
 }
 
 impl PeerRuntimeHandle {
@@ -146,6 +149,11 @@ impl PeerRuntimeHandle {
 
     pub fn input_enabled(&self) -> bool {
         self.input_gate.load(Ordering::SeqCst)
+    }
+
+    /// Hook-safe, non-async view of whether any peer is attached.
+    pub fn connected_now(&self) -> bool {
+        self.peer_connected.load(Ordering::SeqCst)
     }
 
     /// Queue a message for the connected peer. The ack resolves after the
@@ -248,6 +256,7 @@ struct PeerRuntime {
     next_generation: u64,
     active_outbound_generation: u64,
     input_gate: Arc<AtomicBool>,
+    peer_connected: Arc<AtomicBool>,
     last_input_window: Instant,
     input_events_in_window: usize,
 }
@@ -262,10 +271,12 @@ impl PeerRuntime {
     ) -> PeerRuntimeHandle {
         let (command_sender, commands) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let peer_connected = Arc::new(AtomicBool::new(false));
         let handle = PeerRuntimeHandle {
             commands: command_sender.clone(),
             identity: Arc::new(Mutex::new(None)),
             input_gate: input_gate.clone(),
+            peer_connected: peer_connected.clone(),
         };
         tokio::spawn(async move {
             let mut runtime = Self {
@@ -282,6 +293,7 @@ impl PeerRuntime {
                 next_generation: 0,
                 active_outbound_generation: 0,
                 input_gate,
+                peer_connected,
                 last_input_window: Instant::now(),
                 input_events_in_window: 0,
             };
@@ -366,6 +378,7 @@ impl PeerRuntime {
                     },
                 );
                 self.peer_device_id = peer_device_id;
+                self.peer_connected.store(true, Ordering::SeqCst);
                 let _ = ack.send(());
             }
             RuntimeCommand::AttachInbound {
@@ -393,6 +406,7 @@ impl PeerRuntime {
                         generation,
                     },
                 );
+                self.peer_connected.store(true, Ordering::SeqCst);
                 let _ = ack.send(());
             }
             RuntimeCommand::ConnectionClosed { key, generation } => {
@@ -409,6 +423,9 @@ impl PeerRuntime {
                     // arrive for its in-flight files. Remove the `.part` files
                     // instead of leaving them on disk indefinitely.
                     if self.connections.is_empty() {
+                        // No peer left: release local input immediately instead
+                        // of leaving the OS hooks swallowing every event.
+                        self.peer_connected.store(false, Ordering::SeqCst);
                         let mut state = self.state.lock().unwrap();
                         state.transfers.cleanup_disconnected_peer();
                     }
@@ -417,7 +434,9 @@ impl PeerRuntime {
             RuntimeCommand::Status { ack } => {
                 let _ = ack.send(!self.connections.is_empty());
             }
-            RuntimeCommand::Shutdown => {}
+            RuntimeCommand::Shutdown => {
+                self.peer_connected.store(false, Ordering::SeqCst);
+            }
         }
     }
 

@@ -124,6 +124,9 @@ pub struct InputBridge {
     pub forwarding: bool,
     pub target: String,
     outgoing: Option<mpsc::UnboundedSender<Message>>,
+    /// Production gate: local input is only consumed when a peer is actually
+    /// connected. Test mode leaves this unset and keeps its existing behavior.
+    connection_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Default for InputBridge {
@@ -138,24 +141,45 @@ impl InputBridge {
             forwarding: false,
             target: String::new(),
             outgoing: None,
+            connection_gate: None,
         }
     }
 
     /// Test/transport-friendly constructor: captured events are emitted as
     /// `Message::InputEvent` on `outgoing` while forwarding is active.
     pub fn with_sender(target: &str, outgoing: mpsc::UnboundedSender<Message>) -> Self {
+        Self::with_connection_gate(target, outgoing, Arc::new(|| true))
+    }
+
+    /// Production constructor. `gate` must report whether a peer is connected;
+    /// without one the OS hooks would swallow local input even with no peer.
+    pub fn with_connection_gate(
+        target: &str,
+        outgoing: mpsc::UnboundedSender<Message>,
+        gate: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
         Self {
             forwarding: false,
             target: target.to_string(),
             outgoing: Some(outgoing),
+            connection_gate: Some(gate),
         }
     }
 
-    /// Handle a locally captured event. When forwarding, the event is sent to
-    /// the target and the caller (OS hook) should suppress local delivery.
-    /// When not forwarding the OS keeps the event; remote events are applied
-    /// through `inject`, which prevents local/remote loops.
-    pub fn handle(&mut self, event: CapturedEvent) {
+    /// True only while forwarding is enabled and there is a peer to receive it.
+    pub fn active(&self) -> bool {
+        self.forwarding
+            && self
+                .connection_gate
+                .as_ref()
+                .map(|gate| gate())
+                .unwrap_or(true)
+    }
+
+    /// Handle a locally captured event. Returns whether the OS hook should
+    /// suppress local delivery. When forwarding is not active the OS keeps the
+    /// event; remote events are applied through `inject`, preventing loops.
+    pub fn handle(&mut self, event: CapturedEvent) -> bool {
         if let CapturedEvent::Hotkey(name) = &event {
             if *name == escape_hotkey() {
                 self.forwarding = false;
@@ -165,22 +189,23 @@ impl InputBridge {
                 if let Some(callback) = STOP_CALLBACK.get() {
                     callback();
                 }
-                return;
+                return true;
             }
         }
 
-        if !self.forwarding {
-            return;
+        if !self.active() {
+            return false;
         }
 
         let Some(outgoing) = &self.outgoing else {
-            return;
+            return false;
         };
         let payload = bincode::serialize(&event).unwrap_or_default();
         let _ = outgoing.send(Message::InputEvent {
             target: self.target.clone(),
             payload,
         });
+        true
     }
 
     /// Apply an event received from a peer on the local machine. Local escape
@@ -337,9 +362,7 @@ mod win {
 
                     if let Some(bridge) = BRIDGE.get() {
                         let mut bridge = bridge.lock().unwrap();
-                        let was_forwarding = bridge.forwarding;
-                        bridge.handle(event);
-                        if was_forwarding {
+                        if bridge.handle(event) {
                             return LRESULT(1);
                         }
                     }
@@ -361,9 +384,7 @@ mod win {
                 };
                 if let Some(bridge) = BRIDGE.get() {
                     let mut bridge = bridge.lock().unwrap();
-                    let was_forwarding = bridge.forwarding;
-                    bridge.handle(event);
-                    if was_forwarding {
+                    if bridge.handle(event) {
                         return LRESULT(1);
                     }
                 }
@@ -540,6 +561,28 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn forwarding_without_a_connected_peer_keeps_local_input() {
+        // Regression: production enabled forwarding at startup even with no
+        // peer, so the OS hooks swallowed every local key press and mouse move.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_connection_gate("pc-b", tx, Arc::new(|| false));
+        bridge.forwarding = true;
+        let suppress = bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 });
+        assert!(!suppress, "local input must reach the OS when no peer is connected");
+        assert!(rx.try_recv().is_err(), "event must not be sent without a peer");
+    }
+
+    #[test]
+    fn forwarding_with_a_connected_peer_suppresses_local_input() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_connection_gate("pc-b", tx, Arc::new(|| true));
+        bridge.forwarding = true;
+        let suppress = bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 });
+        assert!(suppress, "input must be consumed locally when it is sent to a peer");
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]
