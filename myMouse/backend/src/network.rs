@@ -670,6 +670,43 @@ impl PeerRuntime {
                 };
                 match result {
                     Ok(messages) => {
+                        // handle_accept returns exactly one chunk by design. Keep
+                        // draining the sender until the final chunk and its
+                        // completion frame are queued, or larger files stall.
+                        let mut messages = messages;
+                        let mut completed = messages.iter().any(|m| {
+                            matches!(m, Message::FileTransferComplete { .. })
+                        });
+                        loop {
+                            if completed {
+                                break;
+                            }
+                            let next = {
+                                let mut state = self.state.lock().unwrap();
+                                state
+                                    .transfers
+                                    .next_chunks(&transfer_id, crate::file_transfer::DEFAULT_CHUNK_BYTES)
+                            };
+                            match next {
+                                Ok(next) if next.is_empty() => {
+                                    emit_transfer_failure(&transfer_id, "transfer produced no chunks");
+                                    break;
+                                }
+                                Ok(next) => {
+                                    completed = next.iter().any(|m| {
+                                        matches!(m, Message::FileTransferComplete { .. })
+                                    });
+                                    messages.extend(next);
+                                    if completed {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    emit_transfer_failure(&transfer_id, &error.to_string());
+                                    break;
+                                }
+                            }
+                        }
                         let record = {
                             let state = self.state.lock().unwrap();
                             state
@@ -993,6 +1030,58 @@ mod tests {
             input_events_in_window: 0,
         };
         (runtime, peer_connected, active_peer_id)
+    }
+
+    #[test]
+    fn accept_sends_every_chunk_for_large_file() {
+        // Regression: handle_accept produced a single 256 KiB chunk and the
+        // runtime never asked for the rest, so larger transfers stalled forever.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("large.bin");
+        let size = crate::file_transfer::DEFAULT_CHUNK_BYTES * 2 + 17;
+        std::fs::write(&source, vec![7u8; size]).unwrap();
+
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        let (offer, _) = app.transfers.create_offer(&source, "pc-b").unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Outbound,
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+            message: Message::FileTransferAccept {
+                transfer_id: offer.transfer_id,
+            },
+        });
+
+        let mut chunk_count = 0;
+        let mut chunk_bytes = 0usize;
+        let mut complete_count = 0;
+        while let Ok(frame) = rx.try_recv() {
+            match frame.message {
+                Message::FileTransferChunk(chunk) => {
+                    chunk_count += 1;
+                    chunk_bytes += chunk.data.len();
+                }
+                Message::FileTransferComplete { .. } => complete_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(chunk_count, 3, "all file chunks must be sent on accept");
+        assert_eq!(chunk_bytes, size, "all file bytes must be sent on accept");
+        assert_eq!(complete_count, 1, "transfer must complete on accept");
     }
 
     #[test]
