@@ -28,21 +28,21 @@ struct TestInstance {
 }
 
 impl TestInstance {
-    async fn start(id: &str, port: u16, peer: Option<(&str, u16)>) -> Self {
+    async fn start(id: &str, port: u16, peer_id: &str, peer_port: Option<u16>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mymouse-backend"));
         command
             .arg("--test-mode")
             .arg("--device-id")
             .arg(id)
+            .arg("--peer-id")
+            .arg(peer_id)
             .arg("--port")
             .arg(port.to_string())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
-        if let Some((peer_id, peer_port)) = peer {
+        if let Some(peer_port) = peer_port {
             command
-                .arg("--peer-id")
-                .arg(peer_id)
                 .arg("--peer")
                 .arg(format!("127.0.0.1:{peer_port}"));
         }
@@ -115,11 +115,11 @@ async fn forwards_one_crossing_event() {
     }
 
     // PC B listens first; PC A connects with the pinned test fingerprint.
-    let mut b = TestInstance::start("pc-b", port_b, None).await;
+    let mut b = TestInstance::start("pc-b", port_b, "pc-a", None).await;
     let ready_b = b.wait_for("ready").await;
     assert_eq!(ready_b["deviceId"], "pc-b");
 
-    let mut a = TestInstance::start("pc-a", port_a, Some(("pc-b", port_b))).await;
+    let mut a = TestInstance::start("pc-a", port_a, "pc-b", Some(port_b)).await;
     let ready_a = a.wait_for("ready").await;
     assert_eq!(ready_a["deviceId"], "pc-a");
     let connected = a.wait_for("connected").await;
@@ -140,10 +140,12 @@ async fn forwards_one_crossing_event() {
     assert_eq!(result["x"], 0);
     assert_eq!(result["y"], 200);
     // `input` is emitted only for Message::InputEvent on the receiving peer.
+    // Raw payload bytes are never logged; only the event kind and size are.
     let delivered = b.wait_for("input").await;
-    assert_eq!(delivered["target"], "pc-b");
-    let payload_hex = delivered["payloadHex"]
-        .as_str()
-        .expect("InputEvent payloadHex");
-    assert!(!payload_hex.is_empty(), "InputEvent carried an empty payload");
+    assert_eq!(delivered["deviceId"], "pc-a");
+    assert_eq!(delivered["kind"], "mouse");
+    let payload_bytes = delivered["payloadBytes"]
+        .as_u64()
+        .expect("InputEvent payloadBytes");
+    assert!(payload_bytes > 0, "InputEvent carried an empty payload");
 }

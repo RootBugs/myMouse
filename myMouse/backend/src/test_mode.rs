@@ -15,11 +15,13 @@ use crate::{
     apply_clipboard_settings, apply_file_transfer_settings, clipboard_message_from_params,
     config_dir, AppState,
 };
+use crate::trust::Capabilities;
 use mymouse_protocol::Message;
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -167,7 +169,22 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
         config_dir(),
         device_id.clone(),
     )));
-    let network = start_network(state.clone(), device_id.clone(), peer_id.clone(), false);
+    // Test mode has no interactive pairing; grant the statically configured
+    // peer full capabilities so the same dispatch gates can be exercised.
+    {
+        let mut st = state.lock().unwrap();
+        st.trust.grant(&peer_id, Capabilities::default());
+        let _ = std::fs::create_dir_all(&st.config_dir);
+        let trust_file = st.config_dir.join("trust.json");
+        let _ = st.trust.save(trust_file);
+    }
+    let network = start_network(
+        state.clone(),
+        device_id.clone(),
+        peer_id.clone(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+    );
 
     let server = Server::bind(
         &format!("127.0.0.1:{}", config.port),

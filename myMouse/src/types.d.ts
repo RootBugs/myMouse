@@ -39,13 +39,27 @@ export interface DiscoveredPeer {
   fingerprint: string;
 }
 
+export interface DeviceCapabilities {
+  input: boolean;
+  clipboard: boolean;
+  files: boolean;
+  screen: boolean;
+}
+
+export interface TrustedDevice {
+  name: string;
+  id?: string;
+  capabilities?: DeviceCapabilities;
+}
+
 declare global {
   interface Window {
     mymouse: {
       status: () => Promise<{ ok: boolean; connected: boolean; deviceId?: string }>;
-      devices: () => Promise<Array<{ name: string; id?: string; capabilities?: unknown }>>;
+      devices: () => Promise<TrustedDevice[]>;
       pairingUri: () => Promise<string>;
-      approvePairing: (code: string) => Promise<{ ok: boolean }>;
+      approvePairing: (code: string, peerId: string, fingerprint: string, verified: boolean) =>
+        Promise<{ ok: boolean; error?: string }>;
       setLayout: (layout: unknown) => Promise<{ ok: boolean }>;
 
       getSettings: () => Promise<{ ok: boolean; settings: AppSettings }>;
@@ -61,8 +75,22 @@ declare global {
       sendClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
       connectPeer: (address: string, peerDeviceId: string, fingerprint: string) => Promise<{ ok: boolean; error?: string }>;
       discoveredPeers: () => Promise<{ ok: boolean; peers: DiscoveredPeer[] }>;
-      pairDiscovered: (peerId: string) => Promise<{ ok: boolean; error?: string }>;
+      pairDiscovered: (peerId: string, fingerprint: string, verified: boolean) =>
+        Promise<{ ok: boolean; error?: string }>;
       localIdentity: () => Promise<{ ok: boolean; deviceId?: string; fingerprint?: string; listenPort?: number; error?: string }>;
+
+      stopInput: () => Promise<{ ok: boolean; enabled: boolean }>;
+      emergencyStop: () => Promise<{ ok: boolean; enabled: boolean }>;
+      resumeInput: () => Promise<{ ok: boolean; enabled: boolean }>;
+      revokeDevice: (peerId: string) => Promise<{ ok: boolean; error?: string }>;
+      revokePairing: (peerId: string) => Promise<{ ok: boolean; error?: string }>;
+      setDeviceCapabilities: (
+        peerId: string,
+        input: boolean,
+        clipboard: boolean,
+        files: boolean,
+        screen: boolean,
+      ) => Promise<{ ok: boolean; error?: string }>;
 
       onNotification?: (cb: (message: Record<string, unknown>) => void) => () => void;
     };

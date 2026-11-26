@@ -180,7 +180,7 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         crypto_provider();
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
             .with_single_cert(
                 vec![CertificateDer::from(cert_der)],
@@ -218,7 +218,7 @@ impl Server {
         let local_addr = listener.local_addr()?;
         let provider = crypto_provider();
         let verifier = PinnedClientVerifier { pins, provider };
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_client_cert_verifier(Arc::new(verifier))
             .with_single_cert(
                 vec![CertificateDer::from(cert_der)],
@@ -278,9 +278,10 @@ impl Client {
             fingerprints: pinned.to_vec(),
             provider,
         };
-        let builder = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier));
+        let builder =
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier));
         let config = match identity {
             Some((cert_der, key_der)) => builder.with_client_auth_cert(
                 vec![CertificateDer::from(cert_der)],

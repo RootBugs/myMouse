@@ -4,7 +4,8 @@ contextBridge.exposeInMainWorld('mymouse', {
   status: () => ipcRenderer.invoke('mymouse:call', 'status'),
   devices: () => ipcRenderer.invoke('mymouse:call', 'devices'),
   pairingUri: () => ipcRenderer.invoke('mymouse:call', 'pairingUri'),
-  approvePairing: (code: string) => ipcRenderer.invoke('mymouse:call', 'approvePairing', { code }),
+  approvePairing: (code: string, peerId: string, fingerprint: string, verified: boolean) =>
+    ipcRenderer.invoke('mymouse:call', 'approvePairing', { code, peerId, fingerprint, verified }),
   setLayout: (layout: unknown) => ipcRenderer.invoke('mymouse:call', 'setLayout', { layout }),
 
   getSettings: () => ipcRenderer.invoke('mymouse:call', 'getSettings'),
@@ -24,8 +25,28 @@ contextBridge.exposeInMainWorld('mymouse', {
   connectPeer: (address: string, peerDeviceId: string, fingerprint: string) =>
     ipcRenderer.invoke('mymouse:call', 'connectPeer', { address, peerDeviceId, fingerprint }),
   discoveredPeers: () => ipcRenderer.invoke('mymouse:call', 'discoveredPeers'),
-  pairDiscovered: (peerId: string) => ipcRenderer.invoke('mymouse:call', 'pairDiscovered', { peerId }),
+  pairDiscovered: (peerId: string, fingerprint: string, verified: boolean) =>
+    ipcRenderer.invoke('mymouse:call', 'pairDiscovered', { peerId, fingerprint, verified }),
   localIdentity: () => ipcRenderer.invoke('mymouse:call', 'localIdentity'),
+
+  stopInput: () => ipcRenderer.invoke('mymouse:call', 'stopInput'),
+  emergencyStop: () => ipcRenderer.invoke('mymouse:call', 'emergencyStop'),
+  resumeInput: () => ipcRenderer.invoke('mymouse:call', 'resumeInput'),
+  revokeDevice: (peerId: string) => ipcRenderer.invoke('mymouse:call', 'revokeDevice', { peerId }),
+  revokePairing: (peerId: string) => ipcRenderer.invoke('mymouse:call', 'revokePairing', { peerId }),
+  setDeviceCapabilities: (
+    peerId: string,
+    input: boolean,
+    clipboard: boolean,
+    files: boolean,
+    screen: boolean,
+  ) => ipcRenderer.invoke('mymouse:call', 'setDeviceCapabilities', {
+    peerId,
+    input,
+    clipboard,
+    files,
+    screen,
+  }),
 
   onNotification: (cb: (message: unknown) => void) => {
     const listener = (_event: unknown, message: unknown) => cb(message);

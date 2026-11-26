@@ -30,11 +30,11 @@ impl PairSession {
     }
 
     pub fn matches(&self, code: &str) -> bool {
-        self.expires_at > Instant::now() && self.code == code
+        !self.approved && self.expires_at > Instant::now() && self.code == code
     }
 
     pub fn approve(&mut self) -> bool {
-        if self.expires_at <= Instant::now() {
+        if self.approved || self.expires_at <= Instant::now() {
             return false;
         }
         self.approved = true;
@@ -43,6 +43,14 @@ impl PairSession {
 
     pub fn approved(&self) -> bool {
         self.approved
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
     }
 }
 
@@ -55,5 +63,18 @@ mod tests {
         let code = generate_code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn session_requires_exact_code_and_is_single_use() {
+        let mut session = PairSession::new("pc-b");
+        let code = session.code.clone();
+        let wrong = format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000);
+        assert!(session.matches(&code));
+        assert!(!session.matches(&wrong), "unrelated code must be rejected");
+        assert!(session.approve());
+        assert!(session.approved());
+        assert!(!session.approve(), "a pairing session cannot be reused");
+        assert!(!session.matches(&code), "an approved session must not match again");
     }
 }

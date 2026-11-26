@@ -130,7 +130,7 @@ export default function Settings({ settings, onChange, onRefresh }: Props) {
       <label><input type="checkbox" checked={settings.auto_reconnect} readOnly /> Auto reconnect</label>
       <label><input type="checkbox" checked={false} readOnly /> Launch at Windows start (off until you enable it)</label>
       <label><input type="checkbox" checked={settings.quick_drop_enabled} readOnly /> Quick Drop zone</label>
-      <p className="hint">Escape hotkey: Ctrl+Alt+Shift+M</p>
+      <p className="hint">Use Emergency stop on the Dashboard to close the input gate immediately; remote hotkeys are rejected.</p>
       <p className="hint">v1 cannot inject into UAC prompts, secure desktop, or locked sessions.</p>
     </section>
   );

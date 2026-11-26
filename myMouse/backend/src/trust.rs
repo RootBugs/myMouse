@@ -32,10 +32,15 @@ pub struct TrustStore {
     devices: HashMap<String, TrustedDevice>,
 }
 
-fn sanitize_id(id: &str) -> String {
-    id.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect()
+/// Device IDs are used as exact trust-store and pin keys. Sanitising them
+/// many-to-one allowed a crafted ID to overwrite an unrelated trusted device,
+/// so invalid IDs are rejected outright instead.
+pub fn is_valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 impl TrustStore {
@@ -60,25 +65,56 @@ impl TrustStore {
     }
 
     pub fn is_trusted(&self, id: &str) -> bool {
-        self.devices.contains_key(&sanitize_id(id))
+        is_valid_id(id) && self.devices.contains_key(id)
     }
 
     pub fn grant(&mut self, id: &str, capabilities: Capabilities) {
+        if is_valid_id(id) {
+            self.devices.insert(
+                id.to_string(),
+                TrustedDevice {
+                    capabilities,
+                    fingerprint: None,
+                },
+            );
+        }
+    }
+
+    /// Add a device only if it is not already trusted, so pairing a new peer
+    /// cannot silently replace another device's capabilities or pin.
+    pub fn grant_if_absent(&mut self, id: &str, capabilities: Capabilities) -> bool {
+        if !is_valid_id(id) || self.devices.contains_key(id) {
+            return false;
+        }
         self.devices.insert(
-            sanitize_id(id),
+            id.to_string(),
             TrustedDevice {
                 capabilities,
                 fingerprint: None,
             },
         );
+        true
     }
 
     pub fn revoke(&mut self, id: &str) {
-        self.devices.remove(&sanitize_id(id));
+        if is_valid_id(id) {
+            self.devices.remove(id);
+        }
     }
 
     pub fn capabilities(&self, id: &str) -> Option<&Capabilities> {
-        self.devices.get(&sanitize_id(id)).map(|d| &d.capabilities)
+        if !is_valid_id(id) {
+            return None;
+        }
+        self.devices.get(id).map(|d| &d.capabilities)
+    }
+
+    pub fn set_capabilities(&mut self, id: &str, capabilities: Capabilities) -> bool {
+        let Some(device) = self.devices.get_mut(id) else {
+            return false;
+        };
+        device.capabilities = capabilities;
+        true
     }
 
     pub fn capabilities_map(&self) -> Vec<(String, Capabilities)> {
@@ -89,15 +125,19 @@ impl TrustStore {
     }
 
     pub fn set_fingerprint(&mut self, id: &str, fingerprint: String) {
-        if let Some(device) = self.devices.get_mut(&sanitize_id(id)) {
+        if !is_valid_id(id) {
+            return;
+        }
+        if let Some(device) = self.devices.get_mut(id) {
             device.fingerprint = Some(fingerprint);
         }
     }
 
     pub fn fingerprint(&self, id: &str) -> Option<&str> {
-        self.devices
-            .get(&sanitize_id(id))
-            .and_then(|d| d.fingerprint.as_deref())
+        if !is_valid_id(id) {
+            return None;
+        }
+        self.devices.get(id).and_then(|d| d.fingerprint.as_deref())
     }
 
     /// All pinned device/fingerprint pairs, for configuring mutual TLS.
@@ -114,12 +154,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trust_store_stays_inside_config_dir() {
+    fn invalid_peer_ids_are_never_trusted() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = TrustStore::default();
-        store.grant("pc/../evil", Capabilities::default());
+        for id in ["", "pc/../evil", "pc!b", " pc", "a/b", "a.b"] {
+            store.grant(id, Capabilities::default());
+            assert!(!store.is_trusted(id), "invalid id was trusted: {id:?}");
+        }
+        assert!(store.capabilities_map().is_empty());
         store.save(dir.path().join("trust.json")).unwrap();
         assert!(dir.path().join("trust.json").exists());
         assert_eq!(dir.path().read_dir().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn trust_ids_are_exact_and_revocation_removes_the_pin() {
+        let mut store = TrustStore::default();
+        store.grant("pc-b", Capabilities::default());
+        store.set_fingerprint("pc-b", "a".repeat(64));
+        assert!(store.is_trusted("pc-b"));
+        assert!(!store.is_trusted("pc!b"), "sanitized collisions must not grant trust");
+        assert!(store.fingerprint("pc!b").is_none());
+        store.revoke("pc-b");
+        assert!(!store.is_trusted("pc-b"));
+        assert!(store.fingerprint_map().is_empty());
     }
 }

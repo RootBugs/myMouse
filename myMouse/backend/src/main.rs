@@ -13,6 +13,7 @@ mod trust;
 use clipboard::{ClipboardManager, ClipboardMode, ClipboardSettings, ClipboardSnapshot};
 use file_transfer::{FileTransferManager, FileTransferSettings};
 use identity::Identity;
+use input::InputBridge;
 use mymouse_protocol::{ClipboardKind, Message, PROTOCOL_VERSION};
 use network::PeerRuntimeHandle;
 use serde::{Deserialize, Serialize};
@@ -21,11 +22,13 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use transport::{ClientPinMap, Server};
-use trust::{Capabilities, TrustStore};
+use trust::{is_valid_id, Capabilities, TrustStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AppSettings {
@@ -59,6 +62,10 @@ struct AppState {
     client_pins: ClientPinMap,
     /// Latest mDNS peers, keyed by device ID.
     discovered: Arc<RwLock<HashMap<String, discovery::Peer>>>,
+    /// Short-lived pairing sessions, keyed by the displayed one-time code.
+    pairing_sessions: Mutex<HashMap<String, pairing::PairSession>>,
+    /// Shared capture bridge so RPCs can stop/resume local forwarding.
+    input_bridge: Arc<Mutex<InputBridge>>,
 }
 
 impl AppState {
@@ -86,6 +93,8 @@ impl AppState {
             listen_port: 0,
             client_pins: Arc::new(RwLock::new(HashMap::new())),
             discovered: Arc::new(RwLock::new(HashMap::new())),
+            pairing_sessions: Mutex::new(HashMap::new()),
+            input_bridge: Arc::new(Mutex::new(InputBridge::new())),
         }
     }
 
@@ -248,7 +257,22 @@ async fn handle_request(
         }
         "pairDiscovered" => {
             let peer_id = params.get("peerId").and_then(Value::as_str).unwrap_or("");
-            let (address, port, fingerprint) = {
+            let verified = params.get("verified").and_then(Value::as_bool).unwrap_or(false);
+            let supplied_fp = params
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !verified {
+                return rpc_err(id, "verify the full fingerprint out of band before pairing");
+            }
+            if !is_valid_id(peer_id) {
+                return rpc_err(id, "invalid peer id");
+            }
+            if !is_hex_fingerprint(supplied_fp) {
+                return rpc_err(id, "fingerprint must be 64 hex characters");
+            }
+            let fingerprint = supplied_fp.to_ascii_lowercase();
+            let (address, port, advertised_fp) = {
                 let st = state.lock().unwrap();
                 match st.discovered.read().ok().and_then(|map| map.get(peer_id).cloned()) {
                     Some(peer) => (peer.address, peer.port, peer.fingerprint),
@@ -257,35 +281,50 @@ async fn handle_request(
                     }
                 }
             };
-            if !is_hex_fingerprint(&fingerprint) {
-                return rpc_err(id, "discovered peer has no valid fingerprint");
+            // mDNS TXT is unauthenticated. The full fingerprint must be
+            // confirmed by the user from the peer's local UI.
+            if !advertised_fp.eq_ignore_ascii_case(&fingerprint) {
+                return rpc_err(id, "fingerprint does not match the discovered peer");
             }
             let Ok(socket_addr) = format!("{address}:{port}").parse::<SocketAddr>() else {
                 return rpc_err(id, "discovered peer has no valid address");
             };
             {
-                let mut st = state.lock().unwrap();
-                st.trust.grant(
-                    peer_id,
-                    Capabilities {
-                        input: true,
-                        clipboard: true,
-                        files: true,
-                        screen: false,
-                    },
-                );
-                st.trust.set_fingerprint(peer_id, fingerprint.clone());
-                let trust_path = st.config_dir.join("trust.json");
-                let _ = st.trust.save(trust_path);
-                if let Ok(mut pins) = st.client_pins.write() {
-                    pins.insert(fingerprint.clone(), peer_id.to_string());
-                };
+                let st = state.lock().unwrap();
+                if let Some(pinned) = st.trust.fingerprint(peer_id) {
+                    if !pinned.eq_ignore_ascii_case(&fingerprint) {
+                        return rpc_err(id, "peer fingerprint changed; revoke the old device first");
+                    }
+                }
             }
+            // Connect first. Trust and pin are persisted only after the pinned
+            // TLS handshake succeeds, so a failed pairing leaves no attacker
+            // pin behind.
             match network
-                .connect(socket_addr, fingerprint, peer_id.to_string())
+                .connect(socket_addr, fingerprint.clone(), peer_id.to_string())
                 .await
             {
-                Ok(()) => rpc_ok(id, json!({ "ok": true })),
+                Ok(()) => {
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.trust.grant_if_absent(
+                            peer_id,
+                            Capabilities {
+                                input: true,
+                                clipboard: true,
+                                files: true,
+                                screen: false,
+                            },
+                        );
+                        st.trust.set_fingerprint(peer_id, fingerprint.clone());
+                        let trust_path = st.config_dir.join("trust.json");
+                        let _ = st.trust.save(trust_path);
+                        if let Ok(mut pins) = st.client_pins.write() {
+                            pins.insert(fingerprint.clone(), peer_id.to_string());
+                        };
+                    }
+                    rpc_ok(id, json!({ "ok": true }))
+                }
                 Err(error) => rpc_err(id, &error),
             }
         }
@@ -296,6 +335,9 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("peer")
                 .to_string();
+            if !is_valid_id(&peer_id) {
+                return rpc_err(id, "invalid peer device id");
+            }
             let fingerprint = params
                 .get("fingerprint")
                 .and_then(Value::as_str)
@@ -316,10 +358,19 @@ async fn handle_request(
                 Ok(()) => {
                     {
                         let mut st = state.lock().unwrap();
+                        st.trust.grant_if_absent(
+                            &peer_id,
+                            Capabilities {
+                                input: true,
+                                clipboard: true,
+                                files: true,
+                                screen: false,
+                            },
+                        );
                         st.trust.set_fingerprint(&peer_id, pinned.clone());
                         if let Ok(mut pins) = st.client_pins.write() {
                             pins.insert(pinned, peer_id.clone());
-                        }
+                        };
                         let trust_path = st.config_dir.join("trust.json");
                         let _ = st.trust.save(trust_path);
                     }
@@ -329,13 +380,143 @@ async fn handle_request(
             }
         }
         "pairingUri" => {
-            let session = pairing::PairSession::new("local-pc");
-            rpc_ok(id, json!(session.pairing_uri()));
+            let st = state.lock().unwrap();
+            let session = pairing::PairSession::new(&st.device_id);
+            let uri = session.pairing_uri();
+            let code = session.code().to_string();
+            if let Ok(mut sessions) = st.pairing_sessions.lock() {
+                sessions.insert(code, session);
+            };
+            drop(st);
+            rpc_ok(id, json!(uri));
         }
         "approvePairing" => {
             let code = params.get("code").and_then(Value::as_str).unwrap_or("");
-            let ok = code.len() == 6 && code.chars().all(|c| c.is_ascii_digit());
-            rpc_ok(id, json!({ "ok": ok }));
+            let peer_id = params.get("peerId").and_then(Value::as_str).unwrap_or("");
+            let fingerprint = params
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let verified = params.get("verified").and_then(Value::as_bool).unwrap_or(false);
+            if !verified {
+                return rpc_err(id, "verify the full fingerprint out of band before approving");
+            }
+            if !is_valid_id(peer_id) {
+                return rpc_err(id, "invalid peer device id");
+            }
+            if !is_hex_fingerprint(fingerprint) {
+                return rpc_err(id, "fingerprint must be 64 hex characters");
+            }
+            {
+                let st = state.lock().unwrap();
+                let Ok(mut sessions) = st.pairing_sessions.lock() else {
+                    return rpc_err(id, "pairing store unavailable");
+                };
+                let Some(session) = sessions.get_mut(code) else {
+                    return rpc_err(id, "unknown or expired pairing code");
+                };
+                if !session.matches(code) || !session.approve() {
+                    return rpc_err(id, "invalid or already used pairing code");
+                }
+            }
+            // Consume the one-time session after a successful approval.
+            {
+                let st = state.lock().unwrap();
+                if let Ok(mut sessions) = st.pairing_sessions.lock() {
+                    sessions.remove(code);
+                };
+            }
+            let fingerprint = fingerprint.to_ascii_lowercase();
+            {
+                let mut st = state.lock().unwrap();
+                if let Some(pinned) = st.trust.fingerprint(peer_id) {
+                    if !pinned.eq_ignore_ascii_case(&fingerprint) {
+                        return rpc_err(id, "peer fingerprint changed; revoke the old device first");
+                    }
+                }
+                st.trust.grant_if_absent(
+                    peer_id,
+                    Capabilities {
+                        input: true,
+                        clipboard: true,
+                        files: true,
+                        screen: false,
+                    },
+                );
+                st.trust.set_fingerprint(peer_id, fingerprint.clone());
+                let trust_path = st.config_dir.join("trust.json");
+                let _ = st.trust.save(trust_path);
+                if let Ok(mut pins) = st.client_pins.write() {
+                    pins.insert(fingerprint, peer_id.to_string());
+                };
+            }
+            rpc_ok(id, json!({ "ok": true }));
+        }
+        "stopInput" | "emergencyStop" => {
+            network.set_input_enabled(false);
+            if let Ok(mut bridge) = state.lock().unwrap().input_bridge.lock() {
+                bridge.stop();
+            };
+            emit(json!({
+                "notification": "inputState",
+                "enabled": false,
+                "message": "remote input stopped",
+            }));
+            rpc_ok(id, json!({ "ok": true, "enabled": false }));
+        }
+        "resumeInput" => {
+            network.set_input_enabled(true);
+            if let Ok(mut bridge) = state.lock().unwrap().input_bridge.lock() {
+                bridge.forwarding = true;
+            };
+            emit(json!({
+                "notification": "inputState",
+                "enabled": true,
+                "message": "remote input resumed",
+            }));
+            rpc_ok(id, json!({ "ok": true, "enabled": true }));
+        }
+        "revokeDevice" | "revokePairing" => {
+            let peer_id = params.get("peerId").and_then(Value::as_str).unwrap_or("");
+            if !is_valid_id(peer_id) {
+                return rpc_err(id, "invalid peer device id");
+            }
+            {
+                let mut st = state.lock().unwrap();
+                st.trust.revoke(peer_id);
+                if let Ok(mut pins) = st.client_pins.write() {
+                    pins.retain(|_, owner| owner != peer_id);
+                };
+                let trust_path = st.config_dir.join("trust.json");
+                let _ = st.trust.save(trust_path);
+            }
+            rpc_ok(id, json!({ "ok": true }));
+        }
+        "setDeviceCapabilities" => {
+            let peer_id = params.get("peerId").and_then(Value::as_str).unwrap_or("");
+            if !is_valid_id(peer_id) {
+                return rpc_err(id, "invalid peer device id");
+            }
+            let caps = Capabilities {
+                input: params.get("input").and_then(Value::as_bool).unwrap_or(false),
+                clipboard: params.get("clipboard").and_then(Value::as_bool).unwrap_or(false),
+                files: params.get("files").and_then(Value::as_bool).unwrap_or(false),
+                screen: params.get("screen").and_then(Value::as_bool).unwrap_or(false),
+            };
+            let updated = {
+                let mut st = state.lock().unwrap();
+                let updated = st.trust.set_capabilities(peer_id, caps);
+                if updated {
+                    let trust_path = st.config_dir.join("trust.json");
+                    let _ = st.trust.save(trust_path);
+                }
+                updated
+            };
+            if updated {
+                rpc_ok(id, json!({ "ok": true }))
+            } else {
+                rpc_err(id, "unknown device")
+            }
         }
         "setLayout" => {
             rpc_ok(id, json!({ "ok": true }));
@@ -541,7 +722,42 @@ async fn run_ipc() {
     let config = config_dir();
     let state = Arc::new(Mutex::new(AppState::new(config.clone())));
     let device_id = state.lock().unwrap().device_id.clone();
-    let network = network::start(state.clone(), device_id.clone(), String::new(), true);
+    let input_gate = Arc::new(AtomicBool::new(true));
+    let network = network::start(
+        state.clone(),
+        device_id.clone(),
+        String::new(),
+        true,
+        input_gate,
+    );
+
+    // Production input capture: local events are forwarded to exactly one
+    // peer, while remote events are injected only through the runtime gate.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Message>();
+    let forward_network = network.clone();
+    tokio::spawn(async move {
+        while let Some(message) = input_rx.recv().await {
+            if forward_network.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    let bridge = Arc::new(Mutex::new(InputBridge::with_sender(&device_id, input_tx)));
+    bridge.lock().unwrap().forwarding = true;
+    {
+        let mut st = state.lock().unwrap();
+        st.input_bridge = bridge.clone();
+    }
+    let stop_network = network.clone();
+    input::set_stop_callback(Arc::new(move || {
+        stop_network.set_input_enabled(false);
+        emit(json!({
+            "notification": "inputState",
+            "enabled": false,
+            "message": "escape hotkey returned input to this PC",
+        }));
+    }));
+    let _hook_task = InputBridge::start(bridge);
 
     // Production identity is generated once and reused; its fingerprint is the
     // public pairing token. The private key never leaves the config directory.

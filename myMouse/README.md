@@ -33,9 +33,11 @@ Builds are **unsigned** until a code-signing certificate is provided.
   64-hex SHA-256 fingerprint and rejects a mismatch with stored trust.
 - Discovery-backed pairing RPCs: `discoveredPeers` lists nearby peers (id, name,
   address, port, fingerprint), a `discoveredPeer` notification is emitted when a
-  peer is found, and `pairDiscovered { peerId }` explicitly approves a peer,
-  pins its advertised fingerprint, saves `trust.json`, updates the inbound
-  mutual-TLS client-pin map, and connects. Discovery alone never grants trust.
+  peer is found, and `pairDiscovered { peerId, fingerprint, verified }` requires
+  the full 64-hex fingerprint to be entered and marked verified out of band.
+  The advertised fingerprint is only a hint; the backend connects with the
+  supplied pin first and saves `trust.json` / the mutual-TLS client pin only
+  after the pinned TLS handshake succeeds. Discovery alone never grants trust.
 - A self-signed TLS identity generated on first run and persisted in the myMouse
   config directory. `localIdentity` exposes its public fingerprint and listen
   port; the private key is never returned over RPC or logged.
@@ -101,9 +103,11 @@ it, it will require your explicit action.
    code.
 3. On the joining machine, scan the QR code or enter the six-digit code, then
    confirm the host name that appears.
-4. The host approves the request. On approval the two installs exchange and pin
-   a per-pair TLS certificate fingerprint. A wrong code or an unpinned
-   certificate is rejected before input forwarding is enabled.
+4. The host approves the request by entering the joining peer's device ID and
+   full 64-hex fingerprint, ticking the out-of-band verification checkbox, and
+   pressing Approve. Pairing codes are single-use. On approval the two installs
+   exchange and pin a per-pair TLS certificate fingerprint. A wrong code or an
+   unpinned certificate is rejected before input forwarding is enabled.
 5. Grant only the capabilities you want (input, clipboard, files, screen).
    Capabilities can be revoked later from Device management.
 6. To pair via discovery, keep both installs on the same LAN. The backend
@@ -113,12 +117,14 @@ it, it will require your explicit action.
    `fp`. The `discoveredPeers` RPC returns each discovered peer's id, name,
    address, port, and fingerprint; a `discoveredPeer` notification is emitted
    when a peer is found.
-7. Explicitly approve the discovered peer on **each** machine with
-   `pairDiscovered { "peerId": "..." }`. The backend pins the advertised
-   fingerprint for that device ID, saves `trust.json`, updates the inbound
-   mutual-TLS client-pin map, and connects. Discovery alone never grants trust
-   or connects: a peer cannot connect inbound unless its certificate is pinned
-   for the exact device ID in its v2 `Hello`.
+7. In Device management, compare the full fingerprint shown on the other
+   machine, type it into **Confirm full fingerprint**, tick **I verified this
+   fingerprint out of band**, then press Pair on **each** machine. This calls
+   `pairDiscovered` with `peerId`, the full `fingerprint`, and `verified: true`.
+   The mDNS fingerprint is unauthenticated, so it is never trusted by itself:
+   the backend connects with the supplied pin first and saves `trust.json` and
+   the mutual-TLS client pin only after the handshake succeeds. Discovery alone
+   never grants trust or connects.
 8. For a manual/verification path, **Settings → Show my fingerprint** still
    exposes this install's public fingerprint and listen port, and **Settings →
    Peer connection** (`connectPeer`) accepts the peer's address, device ID, and
@@ -135,15 +141,21 @@ it, it will require your explicit action.
   exactly once, scaling the entry coordinate for the target display.
 - Only one input source is active at a time. Injected events are filtered from
   capture so control cannot loop back.
-- **Panic escape: `Ctrl+Alt+Shift+M`** immediately stops forwarding and releases
-  held modifiers, returning control to the local host.
+- **Emergency stop:** Dashboard → **Emergency stop** immediately closes the
+  input gate and releases held modifiers, returning control to the local host.
+  **Resume input** reopens it. Remote hotkey events are rejected from the wire;
+  a local hotkey is the only escape path and is never trusted from a peer.
 
 ## Trust management
 
 Paired devices, capability grants, and pinned fingerprints (including those
 pinned by `pairDiscovered`) are stored in `trust.json` in the per-user config
-directory. Use Device management to revoke a device or change its capabilities.
-Revoking removes the pin, so the peer must pair again.
+directory. Device management now sends real `setDeviceCapabilities` and
+`revokeDevice` calls; capability toggles are per device and are enforced for
+every inbound message class. Invalid device IDs are rejected outright instead of
+being sanitised into another device's trust entry. Revoking removes the pin, so
+the peer must pair again. Incomplete `.part` files are removed when the last peer
+disconnects, and only 16 incoming transfers can be active at a time.
 
 ## Known limitations
 
@@ -153,8 +165,14 @@ See [docs/limitations.md](docs/limitations.md). In short:
 - Clipboard/file delivery is verified between two processes in test mode; no
   two-physical-PC session was run here. Discovery → pairing → auto-connect is
   implemented and unit/integration tested, but not verified on real hardware;
-  pairing still requires explicit approval on both peers. Remote screen is not
-  implemented.
+  full-fingerprint confirmation and explicit approval are still required on both
+  peers. Remote screen is not implemented.
+- Safety gates (capability enforcement, emergency stop, 250 events/s rate limit,
+  bounded protocol decoding, hotkey rejection, strict IDs, one-time pairing
+  codes, file size/count limits) are covered by unit/integration tests. TLS 1.3
+  is configured at the rustls builder level; no live TLS 1.2 downgrade attempt
+  was executed here. OS-level `SendInput` behaviour is covered by code paths and
+  test-mode notifications, not by a hardware-level audit.
 - Complex keyboard layouts, IMEs, and per-monitor DPI handoff are not complete.
 - Android is source-only with a real pinned-TLS bridge implementation (no APK
   or device test: no Android SDK/NDK/Gradle); Mac is source-only on Windows.

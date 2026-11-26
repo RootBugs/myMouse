@@ -2,7 +2,7 @@ use crate::layout::escape_hotkey;
 use mymouse_protocol::Message;
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -49,13 +49,10 @@ impl<'de> Deserialize<'de> for CapturedEvent {
                 alt,
                 shift,
             }),
-            WireEvent::Hotkey(name) => {
-                let known = match name.as_str() {
-                    "Ctrl+Alt+Shift+M" => "Ctrl+Alt+Shift+M",
-                    _ => return Err(D::Error::custom("unknown hotkey")),
-                };
-                Ok(CapturedEvent::Hotkey(known))
-            }
+            // Hotkeys are local control signals only. A peer must never be
+            // able to synthesise our escape sequence and release host
+            // modifiers or type a key.
+            WireEvent::Hotkey(_) => Err(D::Error::custom("hotkeys cannot be received from a peer")),
             WireEvent::MouseMove { x, y } => Ok(CapturedEvent::MouseMove { x, y }),
         }
     }
@@ -107,6 +104,22 @@ pub fn translate(event: &CapturedEvent, target_os: &str) -> Option<TranslatedEve
     })
 }
 
+/// Normalise an absolute screen coordinate to Win32's 0..65535 virtual desk
+/// range. Integer math in i128 avoids overflow with hostile `i64` values.
+pub fn normalize_coordinate(value: i64, origin: i32, span: i32) -> i32 {
+    let width = (span.max(1) as i128).max(1);
+    let scaled = (value as i128 - origin as i128) * 65_535 / width;
+    scaled.clamp(0, 65_535) as i32
+}
+
+/// Optional hook used by the production runtime so the local escape hotkey
+/// closes the remote-injection gate as well as stopping local capture.
+static STOP_CALLBACK: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+pub fn set_stop_callback(callback: Arc<dyn Fn() + Send + Sync>) {
+    let _ = STOP_CALLBACK.set(callback);
+}
+
 pub struct InputBridge {
     pub forwarding: bool,
     pub target: String,
@@ -146,7 +159,12 @@ impl InputBridge {
         if let CapturedEvent::Hotkey(name) = &event {
             if *name == escape_hotkey() {
                 self.forwarding = false;
-                Self::inject(&event);
+                // Release stuck modifiers without typing the hotkey itself,
+                // and close the remote injection gate if production wired it.
+                Self::release_modifiers();
+                if let Some(callback) = STOP_CALLBACK.get() {
+                    callback();
+                }
                 return;
             }
         }
@@ -165,12 +183,22 @@ impl InputBridge {
         });
     }
 
-    /// Apply an event received from a peer on the local machine.
+    /// Apply an event received from a peer on the local machine. Local escape
+    /// hotkeys are never injectable.
     pub fn inject(event: &CapturedEvent) {
+        if matches!(event, CapturedEvent::Hotkey(_)) {
+            return;
+        }
         #[cfg(windows)]
         win::inject(event);
         #[cfg(not(windows))]
         let _ = event;
+    }
+
+    /// Emergency release of host modifier keys after stopping forwarding.
+    pub fn release_modifiers() {
+        #[cfg(windows)]
+        win::release_modifiers();
     }
 
     /// Install OS hooks (Windows only). The returned task owns the hook
@@ -206,7 +234,7 @@ mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MapVirtualKeyW, SendInput, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
         KEYEVENTF_KEYUP, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE,
-        MOUSEEVENTF_MOVE, MOUSEINPUT, VIRTUAL_KEY, INPUT,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, VIRTUAL_KEY, INPUT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, GetSystemMetrics, SetWindowsHookExW, TranslateMessage,
@@ -378,20 +406,9 @@ mod win {
     pub(super) fn inject(event: &CapturedEvent) {
         let mut inputs: Vec<INPUT> = Vec::new();
         match event {
-            CapturedEvent::Key { .. } | CapturedEvent::Hotkey(_) => {
-                let name = match event {
-                    CapturedEvent::Key { key, .. } => key.as_str(),
-                    CapturedEvent::Hotkey(name) => {
-                        if *name != escape_hotkey() {
-                            return;
-                        }
-                        "M"
-                    }
-                    CapturedEvent::MouseMove { .. } => unreachable!(),
-                };
-                // The escape hotkey releases the modifier keys to restore host
-                // focus; a normal key is pressed and released.
-                let base = name.rsplit('+').next().unwrap_or(name);
+            CapturedEvent::Key { key, .. } => {
+                // A normal key is pressed and released. Hotkeys are local-only.
+                let base = key.rsplit('+').next().unwrap_or(key);
                 let vk = base
                     .chars()
                     .next()
@@ -411,38 +428,21 @@ mod win {
                     };
                     inputs.push(input);
                 }
-                if matches!(event, CapturedEvent::Hotkey(_)) {
-                    for modifier in [VK_CONTROL, VK_MENU, VK_SHIFT] {
-                        let mut input = INPUT::default();
-                        input.r#type = INPUT_KEYBOARD;
-                        input.Anonymous.ki = KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(modifier as u16),
-                            wScan: 0,
-                            dwFlags: KEYEVENTF_KEYUP,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        };
-                        inputs.push(input);
-                    }
-                }
             }
+            CapturedEvent::Hotkey(_) => return,
             CapturedEvent::MouseMove { x, y } => {
                 // MOUSEEVENTF_ABSOLUTE wants 0..65535 over the virtual screen.
                 let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
                 let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
                 let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
                 let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
-                let normalize = |value: i32, origin: i32, span: i32| -> i32 {
-                    let raw = (value - origin) as f64 * 65535.0 / span.max(1) as f64;
-                    raw.round().clamp(0.0, 65535.0) as i32
-                };
                 let mut input = INPUT::default();
                 input.r#type = INPUT_MOUSE;
                 input.Anonymous.mi = MOUSEINPUT {
-                    dx: normalize(*x, origin_x, width),
-                    dy: normalize(*y, origin_y, height),
+                    dx: super::normalize_coordinate(i64::from(*x), origin_x, width),
+                    dy: super::normalize_coordinate(i64::from(*y), origin_y, height),
                     mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time: 0,
                     dwExtraInfo: 0,
                 };
@@ -453,6 +453,27 @@ mod win {
             unsafe {
                 let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
             }
+        }
+    }
+
+    /// Release modifier keys without synthesising any character. Used when
+    /// the local escape hotkey stops forwarding.
+    pub(super) fn release_modifiers() {
+        let mut inputs = Vec::with_capacity(3);
+        for modifier in [VK_CONTROL, VK_MENU, VK_SHIFT] {
+            let mut input = INPUT::default();
+            input.r#type = INPUT_KEYBOARD;
+            input.Anonymous.ki = KEYBDINPUT {
+                wVk: VIRTUAL_KEY(modifier as u16),
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            inputs.push(input);
+        }
+        unsafe {
+            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         }
     }
 
@@ -489,6 +510,22 @@ mod tests {
     }
 
     #[test]
+    fn remote_hotkey_is_rejected_on_deserialize() {
+        // A peer must never be able to send the local escape hotkey and make
+        // us release modifiers or type a key on the host.
+        let bytes = bincode::serialize(&CapturedEvent::Hotkey(escape_hotkey())).unwrap();
+        assert!(bincode::deserialize::<CapturedEvent>(&bytes).is_err());
+    }
+
+    #[test]
+    fn normalize_coordinate_clamps_extreme_values() {
+        assert_eq!(normalize_coordinate(i64::MIN, -100, 1920), 0);
+        assert_eq!(normalize_coordinate(i64::MAX, -100, 1920), 65_535);
+        assert_eq!(normalize_coordinate(960, 0, 1920), 32_767);
+        assert_eq!(normalize_coordinate(10, 100, 1920), 0);
+    }
+
+    #[test]
     fn forwards_captured_event_as_input_event() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut bridge = InputBridge::with_sender("pc-b", tx);
@@ -514,7 +551,6 @@ mod tests {
                 alt: false,
                 shift: false,
             },
-            CapturedEvent::Hotkey("Ctrl+Alt+Shift+M"),
             CapturedEvent::MouseMove { x: -3, y: 7 },
         ] {
             let bytes = bincode::serialize(&event).unwrap();

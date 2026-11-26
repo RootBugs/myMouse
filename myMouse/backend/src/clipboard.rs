@@ -145,6 +145,22 @@ impl ClipboardManager {
         if payload.device_id == self.device_id {
             return None;
         }
+        // Inbound data must obey the same policy as outbound data. A peer
+        // also must not pin arbitration forever with a far-future timestamp.
+        if payload
+            .text
+            .as_ref()
+            .is_some_and(|text| text.len() > MAX_CLIPBOARD_BYTES)
+            || payload
+                .data_base64
+                .as_ref()
+                .is_some_and(|data| data.len() > MAX_CLIPBOARD_BYTES * 2)
+        {
+            return None;
+        }
+        if payload.timestamp_ms > now_ms().saturating_add(300_000) {
+            return None;
+        }
 
         let incoming_ts = payload.timestamp_ms;
         let incoming_seq = payload.seq;
@@ -395,5 +411,35 @@ mod tests {
     fn disabled_settings_block_updates() {
         let mgr = ClipboardManager::new("pc-a", ClipboardSettings { enabled: false, mode: ClipboardMode::Global });
         assert!(mgr.build_update(text_snapshot("x")).is_none());
+    }
+
+    #[test]
+    fn remote_clipboard_respects_size_limit() {
+        let mgr = ClipboardManager::new("pc-a", ClipboardSettings::default());
+        let remote = ClipboardPayload {
+            device_id: "pc-b".into(),
+            kind: ClipboardKind::Text,
+            text: Some("x".repeat(MAX_CLIPBOARD_BYTES + 1)),
+            data_base64: None,
+            mime: None,
+            timestamp_ms: u64::MAX,
+            seq: 1,
+        };
+        assert!(mgr.accept_remote(&remote).is_none());
+    }
+
+    #[test]
+    fn remote_clipboard_rejects_implausible_future_timestamp() {
+        let mgr = ClipboardManager::new("pc-a", ClipboardSettings::default());
+        let remote = ClipboardPayload {
+            device_id: "pc-b".into(),
+            kind: ClipboardKind::Text,
+            text: Some("x".into()),
+            data_base64: None,
+            mime: None,
+            timestamp_ms: now_ms() + 86_400_000,
+            seq: 1,
+        };
+        assert!(mgr.accept_remote(&remote).is_none());
     }
 }

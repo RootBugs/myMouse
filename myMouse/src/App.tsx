@@ -4,7 +4,7 @@ import DeviceLayout from './components/DeviceLayout';
 import DeviceManagement from './components/DeviceManagement';
 import FileTransfer from './components/FileTransfer';
 import Settings from './components/Settings';
-import type { AppSettings, TransferRecord } from './types';
+import type { AppSettings, TransferRecord, TrustedDevice } from './types';
 import './styles.css';
 
 type Section = 'Dashboard' | 'Device layout' | 'File transfer' | 'Device management' | 'Settings';
@@ -22,7 +22,7 @@ const defaultSettings: AppSettings = {
 export default function App() {
   const [section, setSection] = useState<Section>('Dashboard');
   const [connected, setConnected] = useState(false);
-  const [devices, setDevices] = useState<Array<{ name: string; id?: string }>>([]);
+  const [devices, setDevices] = useState<TrustedDevice[]>([]);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
 
@@ -69,7 +69,7 @@ export default function App() {
         {section === 'Dashboard' && <Dashboard connected={connected} devices={devices} transfers={transfers} settings={settings} />}
         {section === 'Device layout' && <DeviceLayout />}
         {section === 'File transfer' && <FileTransfer transfers={transfers} settings={settings} onRefresh={refresh} />}
-        {section === 'Device management' && <DeviceManagement devices={devices} />}
+        {section === 'Device management' && <DeviceManagement devices={devices} onRefresh={refresh} />}
         {section === 'Settings' && <Settings settings={settings} onChange={setSettings} onRefresh={refresh} />}
       </main>
     </div>

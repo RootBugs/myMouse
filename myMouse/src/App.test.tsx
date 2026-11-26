@@ -158,4 +158,40 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Show my fingerprint' }));
     expect(await screen.findByText(`pc-a:24800 — ${fingerprint}`)).toBeInTheDocument();
   });
+
+  it('stops and resumes remote input from the dashboard', async () => {
+    const stopInput = vi.fn(async () => ({ ok: true, enabled: false }));
+    const resumeInput = vi.fn(async () => ({ ok: true, enabled: true }));
+    (window as any).mymouse = {
+      status: async () => ({ ok: true, connected: true }),
+      devices: async () => [],
+      pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
+      approvePairing: async () => ({ ok: true }),
+      setLayout: async () => ({ ok: true }),
+      getSettings: async () => ({
+        ok: true,
+        settings: {
+          clipboard: { enabled: true, mode: 'global' },
+          file_transfer: { auto_accept: false, save_dir: '', max_transfer_bytes: 100 * 1024 * 1024 },
+          auto_reconnect: true,
+          launch_at_start: false,
+          quick_drop_enabled: true,
+        },
+      }),
+      listTransfers: async () => ({ ok: true, transfers: [] }),
+      stopInput,
+      resumeInput,
+    };
+
+    render(<App />);
+    expect(await screen.findByText('Input enabled')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Emergency stop' }));
+    await waitFor(() => expect(stopInput).toHaveBeenCalled());
+    expect(await screen.findByText('Input stopped')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
+    await waitFor(() => expect(resumeInput).toHaveBeenCalled());
+    expect(await screen.findByText('Input enabled')).toBeInTheDocument();
+  });
 });

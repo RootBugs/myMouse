@@ -62,6 +62,7 @@ h2 { font-size: 16px; margin-top: 28px; }
 }
 
 .hint { color: #9aa1b1; font-size: 13px; }
+.fingerprint { display: block; max-width: 620px; overflow-wrap: anywhere; font-size: 11px; color: #9aa1b1; }
 .layout-canvas { width: 100%; max-width: 640px; background: #1c1f26; border-radius: 8px; }
 .layout-node { fill: #262b35; stroke: #4a91ff; stroke-width: 2; }
 .layout-edge { stroke: #4a91ff; stroke-width: 2; }

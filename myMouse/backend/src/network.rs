@@ -10,13 +10,69 @@ use crate::file_transfer::TransferRecord;
 use crate::identity::Identity;
 use crate::input::{CapturedEvent, InputBridge};
 use crate::transport::{Client, PeerStream};
+use crate::trust::Capabilities;
 use crate::{emit, AppState};
 use mymouse_protocol::{ClipboardKind, Message};
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+const MAX_INPUT_EVENTS_PER_SECOND: usize = 250;
+
+/// Capability flags are enforced for every inbound message class, not just
+/// during the Hello handshake. Control messages remain allowed so a peer can
+/// accept/reject an offer it did not originate.
+fn message_allowed_by_capabilities(capabilities: Option<&Capabilities>, message: &Message) -> bool {
+    let Some(capabilities) = capabilities else {
+        return !matches!(
+            message,
+            Message::InputEvent { .. }
+                | Message::ClipboardUpdate(_)
+                | Message::FileTransferOffer(_)
+                | Message::FileTransferChunk(_)
+                | Message::FileTransferComplete { .. }
+        );
+    };
+    match message {
+        Message::InputEvent { .. } => capabilities.input,
+        Message::ClipboardUpdate(_) => capabilities.clipboard,
+        Message::FileTransferOffer(_)
+        | Message::FileTransferChunk(_)
+        | Message::FileTransferComplete { .. } => capabilities.files,
+        _ => true,
+    }
+}
+
+/// Final gate before an event reaches the OS. `enabled` is the user-controlled
+/// emergency stop; `target` must be this machine; hotkeys are local-only.
+fn can_inject(
+    capabilities: Option<&Capabilities>,
+    target: &str,
+    local_device_id: &str,
+    enabled: bool,
+    event: &CapturedEvent,
+) -> bool {
+    enabled
+        && target == local_device_id
+        && !matches!(event, CapturedEvent::Hotkey(_))
+        && capabilities.map(|caps| caps.input).unwrap_or(false)
+}
+
+/// Decode an input payload with a byte budget equal to the frame size. A
+/// hostile length prefix can never make bincode reserve gigabytes.
+fn decode_captured_event(payload: &[u8]) -> Option<CapturedEvent> {
+    use bincode::Options;
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(payload.len() as u64)
+        .deserialize_from(std::io::Cursor::new(payload))
+        .ok()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PeerKey {
@@ -31,8 +87,15 @@ struct OutgoingFrame {
 
 struct InboundFrame {
     key: PeerKey,
+    generation: u64,
     peer_device_id: String,
     message: Message,
+}
+
+struct Connection {
+    tx: mpsc::UnboundedSender<OutgoingFrame>,
+    tasks: Vec<JoinHandle<()>>,
+    generation: u64,
 }
 
 enum RuntimeCommand {
@@ -50,7 +113,7 @@ enum RuntimeCommand {
         peer_device_id: String,
         ack: oneshot::Sender<()>,
     },
-    ConnectionClosed(PeerKey),
+    ConnectionClosed { key: PeerKey, generation: u64 },
     Status {
         ack: oneshot::Sender<bool>,
     },
@@ -64,12 +127,25 @@ pub struct PeerRuntimeHandle {
     /// Cloneable slot for this install's TLS identity, used by mutual-TLS
     /// outbound connections. Test mode never sets it.
     identity: Arc<Mutex<Option<Arc<Identity>>>>,
+    /// Emergency stop shared with the RPC layer. Injection is blocked while
+    /// false even if a trusted peer is still attached.
+    input_gate: Arc<AtomicBool>,
 }
 
 impl PeerRuntimeHandle {
     /// Install this install's TLS identity for outbound mutual-TLS handshakes.
     pub fn set_identity(&self, identity: Arc<Identity>) {
         *self.identity.lock().unwrap() = Some(identity);
+    }
+
+    /// Emergency stop: blocks every inbound input event without dropping the
+    /// TLS connection, so clipboard/file transfers stay usable.
+    pub fn set_input_enabled(&self, enabled: bool) {
+        self.input_gate.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn input_enabled(&self) -> bool {
+        self.input_gate.load(Ordering::SeqCst)
     }
 
     /// Queue a message for the connected peer. The ack resolves after the
@@ -167,8 +243,13 @@ struct PeerRuntime {
     command_sender: mpsc::UnboundedSender<RuntimeCommand>,
     inbound_rx: mpsc::UnboundedReceiver<InboundFrame>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
-    connections: HashMap<PeerKey, mpsc::UnboundedSender<OutgoingFrame>>,
+    connections: HashMap<PeerKey, Connection>,
     next_accepted: u64,
+    next_generation: u64,
+    active_outbound_generation: u64,
+    input_gate: Arc<AtomicBool>,
+    last_input_window: Instant,
+    input_events_in_window: usize,
 }
 
 impl PeerRuntime {
@@ -177,12 +258,14 @@ impl PeerRuntime {
         local_device_id: String,
         peer_device_id: String,
         os_integration: bool,
+        input_gate: Arc<AtomicBool>,
     ) -> PeerRuntimeHandle {
         let (command_sender, commands) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let handle = PeerRuntimeHandle {
             commands: command_sender.clone(),
             identity: Arc::new(Mutex::new(None)),
+            input_gate: input_gate.clone(),
         };
         tokio::spawn(async move {
             let mut runtime = Self {
@@ -196,6 +279,11 @@ impl PeerRuntime {
                 inbound_tx,
                 connections: HashMap::new(),
                 next_accepted: 0,
+                next_generation: 0,
+                active_outbound_generation: 0,
+                input_gate,
+                last_input_window: Instant::now(),
+                input_events_in_window: 0,
             };
             runtime.run().await;
         });
@@ -236,8 +324,8 @@ impl PeerRuntime {
                 // Send to exactly one peer: broadcasting a file offer or a
                 // clipboard update to every accepted connection would leak
                 // data to peers that did not request it.
-                if let Some(tx) = self.connections.get(&target) {
-                    let _ = tx.send(OutgoingFrame {
+                if let Some(connection) = self.connections.get(&target) {
+                    let _ = connection.tx.send(OutgoingFrame {
                         message,
                         ack: Some(ack),
                     });
@@ -250,14 +338,33 @@ impl PeerRuntime {
                 peer_device_id,
                 ack,
             } => {
-                let tx = spawn_connection(
+                // Exactly one outbound peer is active. Abort the previous
+                // tasks so a replaced peer cannot keep injecting input or
+                // re-route `Send` when it eventually disconnects.
+                if let Some(old) = self.connections.remove(&PeerKey::Outbound) {
+                    for task in old.tasks {
+                        task.abort();
+                    }
+                }
+                self.next_generation += 1;
+                let generation = self.next_generation;
+                self.active_outbound_generation = generation;
+                let (tx, tasks) = spawn_connection(
                     stream,
                     PeerKey::Outbound,
+                    generation,
                     peer_device_id.clone(),
                     self.inbound_tx.clone(),
                     self.command_sender.clone(),
                 );
-                self.connections.insert(PeerKey::Outbound, tx);
+                self.connections.insert(
+                    PeerKey::Outbound,
+                    Connection {
+                        tx,
+                        tasks,
+                        generation,
+                    },
+                );
                 self.peer_device_id = peer_device_id;
                 let _ = ack.send(());
             }
@@ -268,18 +375,44 @@ impl PeerRuntime {
             } => {
                 let key = PeerKey::Accepted(self.next_accepted);
                 self.next_accepted += 1;
-                let tx = spawn_connection(
+                self.next_generation += 1;
+                let generation = self.next_generation;
+                let (tx, tasks) = spawn_connection(
                     stream,
                     key,
+                    generation,
                     peer_device_id,
                     self.inbound_tx.clone(),
                     self.command_sender.clone(),
                 );
-                self.connections.insert(key, tx);
+                self.connections.insert(
+                    key,
+                    Connection {
+                        tx,
+                        tasks,
+                        generation,
+                    },
+                );
                 let _ = ack.send(());
             }
-            RuntimeCommand::ConnectionClosed(key) => {
-                self.connections.remove(&key);
+            RuntimeCommand::ConnectionClosed { key, generation } => {
+                // A stale reader must never remove the replacement connection.
+                let stale_outbound = matches!(key, PeerKey::Outbound)
+                    && generation != self.active_outbound_generation;
+                if !stale_outbound {
+                    if let Some(connection) = self.connections.remove(&key) {
+                        for task in connection.tasks {
+                            task.abort();
+                        }
+                    }
+                    // The last peer disappearing means no further chunks can
+                    // arrive for its in-flight files. Remove the `.part` files
+                    // instead of leaving them on disk indefinitely.
+                    if self.connections.is_empty() {
+                        let mut state = self.state.lock().unwrap();
+                        state.transfers.cleanup_disconnected_peer();
+                    }
+                }
             }
             RuntimeCommand::Status { ack } => {
                 let _ = ack.send(!self.connections.is_empty());
@@ -289,8 +422,8 @@ impl PeerRuntime {
     }
 
     fn send_to(&mut self, key: PeerKey, message: Message) {
-        if let Some(tx) = self.connections.get(&key) {
-            let _ = tx.send(OutgoingFrame {
+        if let Some(connection) = self.connections.get(&key) {
+            let _ = connection.tx.send(OutgoingFrame {
                 message,
                 ack: None,
             });
@@ -298,6 +431,28 @@ impl PeerRuntime {
     }
 
     fn dispatch(&mut self, frame: InboundFrame) {
+        // Frames from a replaced outbound connection are discarded even if
+        // its reader was still draining buffered data.
+        if frame.key == PeerKey::Outbound
+            && frame.generation != self.active_outbound_generation
+        {
+            return;
+        }
+        let capabilities = {
+            let state = self.state.lock().unwrap();
+            state
+                .trust
+                .capabilities(&frame.peer_device_id)
+                .cloned()
+        };
+        if !message_allowed_by_capabilities(capabilities.as_ref(), &frame.message) {
+            emit(json!({
+                "notification": "messageRejected",
+                "deviceId": frame.peer_device_id,
+                "reason": "capability not granted",
+            }));
+            return;
+        }
         match frame.message {
             Message::ClipboardUpdate(payload) => {
                 let snapshot = {
@@ -439,16 +594,59 @@ impl PeerRuntime {
                 }
             }
             Message::InputEvent { target, payload } => {
+                let payload_bytes = payload.len();
+                let Some(event) = decode_captured_event(&payload) else {
+                    emit(json!({
+                        "notification": "inputRejected",
+                        "reason": "invalid event payload",
+                        "payloadBytes": payload_bytes,
+                    }));
+                    return;
+                };
+                let gate_open = self.input_gate.load(Ordering::SeqCst);
+                if !can_inject(
+                    capabilities.as_ref(),
+                    &target,
+                    &self.local_device_id,
+                    gate_open,
+                    &event,
+                ) {
+                    emit(json!({
+                        "notification": "inputRejected",
+                        "deviceId": frame.peer_device_id,
+                        "reason": "input disabled or wrong target",
+                    }));
+                    return;
+                }
+                // Bound how much a compromised peer can move/type per second.
+                if self.last_input_window.elapsed() >= Duration::from_secs(1) {
+                    self.last_input_window = Instant::now();
+                    self.input_events_in_window = 0;
+                }
+                if self.input_events_in_window >= MAX_INPUT_EVENTS_PER_SECOND {
+                    emit(json!({
+                        "notification": "inputRejected",
+                        "reason": "rate limit exceeded",
+                    }));
+                    return;
+                }
+                self.input_events_in_window += 1;
+                // Test mode still emits delivery notifications, but never
+                // touches the OS input stack.
+                if self.os_integration {
+                    InputBridge::inject(&event);
+                }
+                // Never dump raw event bytes (keystrokes/clipboard) to stdout.
                 emit(json!({
                     "notification": "input",
-                    "target": target,
-                    "payloadHex": payload.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                    "deviceId": frame.peer_device_id,
+                    "kind": match &event {
+                        CapturedEvent::Key { .. } => "key",
+                        CapturedEvent::MouseMove { .. } => "mouse",
+                        CapturedEvent::Hotkey(_) => "hotkey",
+                    },
+                    "payloadBytes": payload_bytes,
                 }));
-                if self.os_integration && target == self.local_device_id {
-                    if let Ok(event) = bincode::deserialize::<CapturedEvent>(&payload) {
-                        InputBridge::inject(&event);
-                    }
-                }
             }
             other => {
                 emit(json!({
@@ -467,30 +665,33 @@ pub fn start(
     local_device_id: String,
     peer_device_id: String,
     os_integration: bool,
+    input_gate: Arc<AtomicBool>,
 ) -> PeerRuntimeHandle {
-    PeerRuntime::start(state, local_device_id, peer_device_id, os_integration)
+    PeerRuntime::start(state, local_device_id, peer_device_id, os_integration, input_gate)
 }
 
 fn spawn_connection(
     stream: PeerStream,
     key: PeerKey,
+    generation: u64,
     peer_device_id: String,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
     command_tx: mpsc::UnboundedSender<RuntimeCommand>,
-) -> mpsc::UnboundedSender<OutgoingFrame> {
+) -> (mpsc::UnboundedSender<OutgoingFrame>, Vec<JoinHandle<()>>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
     let (mut reader, mut writer) = stream.into_split();
 
     let read_tx = inbound_tx.clone();
     let read_commands = command_tx.clone();
     let read_peer_id = peer_device_id;
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         loop {
             match reader.recv().await {
                 Ok(message) => {
                     if read_tx
                         .send(InboundFrame {
                             key,
+                            generation,
                             peer_device_id: read_peer_id.clone(),
                             message,
                         })
@@ -508,10 +709,10 @@ fn spawn_connection(
                 }
             }
         }
-        let _ = read_commands.send(RuntimeCommand::ConnectionClosed(key));
+        let _ = read_commands.send(RuntimeCommand::ConnectionClosed { key, generation });
     });
 
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let result = writer.send(&frame.message).await.map_err(|e| e.to_string());
             if let Some(ack) = frame.ack {
@@ -520,7 +721,7 @@ fn spawn_connection(
         }
     });
 
-    out_tx
+    (out_tx, vec![reader_task, writer_task])
 }
 
 fn emit_transfer_record(record: &TransferRecord) {
@@ -545,4 +746,120 @@ fn emit_transfer_failure(transfer_id: &str, message: &str) {
         "state": "failed",
         "message": message,
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trust::Capabilities;
+
+    fn caps() -> Capabilities {
+        Capabilities::default()
+    }
+
+    #[test]
+    fn injection_requires_gate_capability_and_matching_target() {
+        let event = CapturedEvent::Key {
+            key: "A".into(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+        };
+        assert!(can_inject(
+            Some(&caps()),
+            "local-pc",
+            "local-pc",
+            true,
+            &event
+        ));
+        assert!(!can_inject(
+            Some(&caps()),
+            "local-pc",
+            "local-pc",
+            false,
+            &event
+        ));
+        assert!(!can_inject(
+            Some(&caps()),
+            "other-pc",
+            "local-pc",
+            true,
+            &event
+        ));
+        assert!(!can_inject(None, "local-pc", "local-pc", true, &event));
+        let no_input = Capabilities {
+            input: false,
+            clipboard: true,
+            files: true,
+            screen: false,
+        };
+        assert!(!can_inject(
+            Some(&no_input),
+            "local-pc",
+            "local-pc",
+            true,
+            &event
+        ));
+        assert!(!can_inject(
+            Some(&caps()),
+            "local-pc",
+            "local-pc",
+            true,
+            &CapturedEvent::Hotkey("Ctrl+Alt+Shift+M")
+        ));
+    }
+
+    #[test]
+    fn capabilities_gate_message_classes() {
+        let none = Capabilities {
+            input: false,
+            clipboard: false,
+            files: false,
+            screen: false,
+        };
+        let input = Message::InputEvent {
+            target: "local-pc".into(),
+            payload: Vec::new(),
+        };
+        let clipboard = Message::ClipboardUpdate(mymouse_protocol::ClipboardPayload {
+            device_id: "pc-b".into(),
+            kind: mymouse_protocol::ClipboardKind::Text,
+            text: Some("x".into()),
+            data_base64: None,
+            mime: None,
+            timestamp_ms: 1,
+            seq: 1,
+        });
+        let offer = Message::FileTransferOffer(mymouse_protocol::FileOffer {
+            transfer_id: "t1".into(),
+            from_device_id: "pc-b".into(),
+            name: "a.txt".into(),
+            size: 1,
+            sha256: "x".into(),
+            mime: None,
+        });
+        assert!(!message_allowed_by_capabilities(Some(&none), &input));
+        assert!(!message_allowed_by_capabilities(Some(&none), &clipboard));
+        assert!(!message_allowed_by_capabilities(Some(&none), &offer));
+        assert!(message_allowed_by_capabilities(
+            Some(&caps()),
+            &input
+        ));
+        assert!(message_allowed_by_capabilities(
+            Some(&caps()),
+            &clipboard
+        ));
+        assert!(message_allowed_by_capabilities(
+            Some(&caps()),
+            &offer
+        ));
+        assert!(message_allowed_by_capabilities(
+            None,
+            &Message::Hello {
+                version: 2,
+                device_id: "pc-b".into(),
+                name: "Peer".into(),
+            }
+        ));
+    }
 }

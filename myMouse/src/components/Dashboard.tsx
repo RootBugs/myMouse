@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { AppSettings, TransferRecord } from '../types';
 
 type Props = {
@@ -8,14 +8,39 @@ type Props = {
   settings: AppSettings;
 };
 
+type InputStateMessage = Record<string, unknown> & { notification?: string; enabled?: boolean };
+
 export default function Dashboard({ connected, devices, transfers, settings }: Props) {
   const [clipboardText, setClipboardText] = useState('');
   const [clipboardMessage, setClipboardMessage] = useState('');
+  const [inputEnabled, setInputEnabled] = useState(true);
+  const [inputMessage, setInputMessage] = useState('');
   const recent = transfers.slice(-5).reverse();
+
+  useEffect(() => {
+    const unsubscribe = window.mymouse.onNotification?.((message: InputStateMessage) => {
+      if (message.notification === 'inputState' && typeof message.enabled === 'boolean') {
+        setInputEnabled(message.enabled);
+      }
+    });
+    return () => unsubscribe?.();
+  }, []);
 
   const sendClipboard = async () => {
     const result = await window.mymouse.sendClipboard(clipboardText);
     setClipboardMessage(result.ok ? 'Sent to peer' : (result.error ?? 'Could not send'));
+  };
+
+  const stopInput = async () => {
+    const result = await window.mymouse.stopInput();
+    setInputEnabled(result.enabled);
+    setInputMessage(result.ok ? 'Remote input stopped.' : 'Could not stop remote input.');
+  };
+
+  const resumeInput = async () => {
+    const result = await window.mymouse.resumeInput();
+    setInputEnabled(result.enabled);
+    setInputMessage(result.ok ? 'Remote input resumed.' : 'Could not resume remote input.');
   };
   return (
     <section>
@@ -63,8 +88,20 @@ export default function Dashboard({ connected, devices, transfers, settings }: P
         {recent.length === 0 && <li className="hint">No transfer history yet.</li>}
       </ul>
 
-      <h2>Escape hotkey</h2>
-      <p className="hint">Ctrl+Alt+Shift+M returns input to this PC.</p>
+      <h2>Remote input</h2>
+      <div className="status-card">
+        <span className="status-label">Injection gate</span>
+        <strong>{inputEnabled ? 'Input enabled' : 'Input stopped'}</strong>
+      </div>
+      <div className="status-card">
+        {inputEnabled ? (
+          <button onClick={() => void stopInput()}>Emergency stop</button>
+        ) : (
+          <button onClick={() => void resumeInput()}>Resume input</button>
+        )}
+        {inputMessage && <span className="hint">{inputMessage}</span>}
+      </div>
+      <p className="hint">Emergency stop closes the injection gate immediately. Remote hotkeys are rejected.</p>
     </section>
   );
 }

@@ -9,6 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
 pub const DEFAULT_CHUNK_BYTES: usize = 256 * 1024;
+/// Upper bound on in-flight incoming transfers. Without it, a peer can open
+/// unlimited offers and fill the save directory with `.part` files.
+pub const MAX_INCOMING_TRANSFERS: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +82,17 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Transfer IDs become part of the on-disk part filename, so only a strict
+/// opaque token is accepted. This rejects `..`, separators, UNC paths, and
+/// other attacker-controlled path syntax before any filesystem call.
+fn is_safe_transfer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn sanitize_file_name(name: &str) -> String {
@@ -232,6 +246,26 @@ impl FileTransferManager {
 
     /// Handle an incoming offer. Returns protocol messages to send (accept/reject).
     pub fn handle_offer(&mut self, offer: FileOffer, peer_device_id: &str) -> Vec<Message> {
+        if !is_safe_transfer_id(&offer.transfer_id) {
+            let record = TransferRecord {
+                transfer_id: offer.transfer_id.clone(),
+                direction: TransferDirection::Incoming,
+                peer_device_id: peer_device_id.to_string(),
+                name: offer.name,
+                size: offer.size,
+                sha256: offer.sha256,
+                state: TransferState::Rejected,
+                bytes_transferred: 0,
+                path: None,
+                message: Some("invalid transfer id".into()),
+                updated_at_ms: now_ms(),
+            };
+            self.push_history(record);
+            return vec![Message::FileTransferReject {
+                transfer_id: offer.transfer_id,
+                reason: Some("invalid transfer id".into()),
+            }];
+        }
         if offer.size > self.settings.max_transfer_bytes {
             let record = TransferRecord {
                 transfer_id: offer.transfer_id.clone(),
@@ -250,6 +284,27 @@ impl FileTransferManager {
             return vec![Message::FileTransferReject {
                 transfer_id: offer.transfer_id,
                 reason: Some("size limit exceeded".into()),
+            }];
+        }
+
+        if self.incoming.len() >= MAX_INCOMING_TRANSFERS {
+            let record = TransferRecord {
+                transfer_id: offer.transfer_id.clone(),
+                direction: TransferDirection::Incoming,
+                peer_device_id: peer_device_id.to_string(),
+                name: offer.name,
+                size: offer.size,
+                sha256: offer.sha256,
+                state: TransferState::Rejected,
+                bytes_transferred: 0,
+                path: None,
+                message: Some("too many active transfers".into()),
+                updated_at_ms: now_ms(),
+            };
+            self.push_history(record);
+            return vec![Message::FileTransferReject {
+                transfer_id: offer.transfer_id,
+                reason: Some("too many active transfers".into()),
             }];
         }
 
@@ -282,9 +337,13 @@ impl FileTransferManager {
         self.push_history(record);
 
         if self.settings.auto_accept {
-            vec![Message::FileTransferAccept {
-                transfer_id: offer.transfer_id,
-            }]
+            match self.accept(&offer.transfer_id) {
+                Ok(messages) => messages,
+                Err(error) => vec![Message::FileTransferReject {
+                    transfer_id: offer.transfer_id,
+                    reason: Some(format!("cannot prepare transfer: {error}")),
+                }],
+            }
         } else {
             Vec::new()
         }
@@ -298,7 +357,12 @@ impl FileTransferManager {
             if let Some(parent) = incoming.part_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            File::create(&incoming.part_path)?;
+            // create_new refuses to follow a pre-planted file/junction at the
+            // predictable part path.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&incoming.part_path)?;
             incoming.record.state = TransferState::Accepted;
             incoming.record.updated_at_ms = now_ms();
             incoming.record.clone()
@@ -385,16 +449,36 @@ impl FileTransferManager {
         let incoming = self.incoming.get_mut(&chunk.transfer_id).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "unknown transfer")
         })?;
-        if let Some(parent) = incoming.part_path.parent() {
-            fs::create_dir_all(parent)?;
+        if !matches!(
+            incoming.record.state,
+            TransferState::Accepted | TransferState::InProgress
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "transfer is not approved",
+            ));
+        }
+        let end = chunk.offset.checked_add(chunk.data.len() as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "chunk offset overflow")
+        })?;
+        if end > incoming.record.size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "chunk exceeds declared size",
+            ));
+        }
+        if chunk.offset != incoming.record.bytes_transferred {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk is out of sequence",
+            ));
         }
         let mut file = OpenOptions::new()
-            .create(true)
             .write(true)
             .open(&incoming.part_path)?;
         file.seek(SeekFrom::Start(chunk.offset))?;
         file.write_all(&chunk.data)?;
-        incoming.record.bytes_transferred = incoming.record.bytes_transferred.max(chunk.offset + chunk.data.len() as u64);
+        incoming.record.bytes_transferred = end;
         incoming.record.state = TransferState::InProgress;
         incoming.record.updated_at_ms = now_ms();
         let record = incoming.record.clone();
@@ -406,9 +490,28 @@ impl FileTransferManager {
     }
 
     pub fn handle_complete(&mut self, transfer_id: &str) -> std::io::Result<TransferRecord> {
-        let mut incoming = self.incoming.remove(transfer_id).ok_or_else(|| {
+        let mut incoming = self.incoming.get(transfer_id).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "unknown transfer")
         })?;
+        if !matches!(
+            incoming.record.state,
+            TransferState::Accepted | TransferState::InProgress
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "transfer is not approved",
+            ));
+        }
+        let mut incoming = self.incoming.remove(transfer_id).expect("checked above");
+        let on_disk = fs::metadata(&incoming.part_path)?.len();
+        if on_disk != incoming.record.size || incoming.record.bytes_transferred != incoming.record.size {
+            incoming.record.state = TransferState::Failed;
+            incoming.record.message = Some("size mismatch".into());
+            incoming.record.updated_at_ms = now_ms();
+            let _ = fs::remove_file(&incoming.part_path);
+            self.push_history(incoming.record.clone());
+            return Ok(incoming.record);
+        }
         let actual = sha256_file(&incoming.part_path)?;
         if actual != incoming.record.sha256 {
             incoming.record.state = TransferState::Failed;
@@ -429,12 +532,22 @@ impl FileTransferManager {
         if dest.exists() {
             let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
             let ext = dest.extension().and_then(|s| s.to_str()).map(|s| format!(".{s}")).unwrap_or_default();
+            let mut found = false;
             for i in 1..1000 {
                 let candidate = dest.with_file_name(format!("{stem} ({i}){ext}"));
                 if !candidate.exists() {
                     dest = candidate;
+                    found = true;
                     break;
                 }
+            }
+            if !found {
+                incoming.record.state = TransferState::Failed;
+                incoming.record.message = Some("destination name exhausted".into());
+                incoming.record.updated_at_ms = now_ms();
+                let _ = fs::remove_file(&incoming.part_path);
+                self.push_history(incoming.record.clone());
+                return Ok(incoming.record);
             }
         }
         fs::rename(&incoming.part_path, &dest)?;
@@ -494,6 +607,19 @@ impl FileTransferManager {
             return Some(outgoing.record);
         }
         None
+    }
+
+    /// Remove every partial file left by a disconnected peer. History is kept
+    /// so the user can still see that a transfer was interrupted.
+    pub fn cleanup_disconnected_peer(&mut self) {
+        let interrupted: Vec<IncomingTransfer> = self.incoming.drain().map(|(_, entry)| entry).collect();
+        for mut incoming in interrupted {
+            let _ = fs::remove_file(&incoming.part_path);
+            incoming.record.state = TransferState::Cancelled;
+            incoming.record.message = Some("peer disconnected".into());
+            incoming.record.updated_at_ms = now_ms();
+            self.push_history(incoming.record);
+        }
     }
 }
 
@@ -601,5 +727,183 @@ mod tests {
             }
         }
         assert!(all_done, "transfer should complete");
+    }
+
+    fn offer_with_id(transfer_id: &str, size: u64, sha256: &str) -> FileOffer {
+        FileOffer {
+            transfer_id: transfer_id.to_string(),
+            from_device_id: "pc-b".into(),
+            name: "note.txt".into(),
+            size,
+            sha256: sha256.to_string(),
+            mime: None,
+        }
+    }
+
+    #[test]
+    fn transfer_id_with_path_traversal_is_rejected() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: true,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        let hostile_id = format!("{}{}", outside.path().display(), "/../escape");
+        let replies = mgr.handle_offer(offer_with_id(&hostile_id, 4, "x"), "pc-b");
+        assert!(matches!(replies.first(), Some(Message::FileTransferReject { .. })));
+        assert!(!outside.path().join("escape.part").exists());
+        assert!(mgr.history().iter().all(|r| r.state != TransferState::Accepted));
+    }
+
+    #[test]
+    fn chunks_are_rejected_before_manual_accept() {
+        let dir = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("manual-2", 4, "x"), "pc-b");
+        let result = mgr.handle_chunk(FileChunk {
+            transfer_id: "manual-2".into(),
+            offset: 0,
+            data: b"test".to_vec(),
+            last: true,
+        });
+        assert!(result.is_err(), "chunks must not be written before approval");
+        assert!(!dir.path().join("note.txt.manual-2.part").exists());
+    }
+
+    #[test]
+    fn completion_is_rejected_before_manual_accept() {
+        let dir = tempdir().unwrap();
+        let digest = sha256_hex(b"test");
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("manual-3", 4, &digest), "pc-b");
+        fs::write(dir.path().join("note.txt.manual-3.part"), b"test").unwrap();
+        assert!(mgr.handle_complete("manual-3").is_err());
+        assert!(!dir.path().join("note.txt").exists());
+    }
+
+    #[test]
+    fn chunk_beyond_declared_size_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: true,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("size-1", 4, "x"), "pc-b");
+        let result = mgr.handle_chunk(FileChunk {
+            transfer_id: "size-1".into(),
+            offset: 8,
+            data: b"test".to_vec(),
+            last: true,
+        });
+        assert!(result.is_err(), "chunks must stay inside the declared size");
+    }
+
+    #[test]
+    fn completion_requires_actual_file_size_to_match_declared_size() {
+        let dir = tempdir().unwrap();
+        let digest = sha256_hex(b"ab");
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: true,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("size-2", 4, &digest), "pc-b");
+        mgr.handle_chunk(FileChunk {
+            transfer_id: "size-2".into(),
+            offset: 0,
+            data: b"ab".to_vec(),
+            last: true,
+        })
+        .unwrap();
+        let record = mgr.handle_complete("size-2").unwrap();
+        assert_eq!(record.state, TransferState::Failed);
+        assert!(!dir.path().join("note.txt").exists());
+    }
+
+    #[test]
+    fn active_incoming_transfers_are_capped() {
+        let dir = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        for index in 0..MAX_INCOMING_TRANSFERS {
+            let replies = mgr.handle_offer(
+                offer_with_id(&format!("cap-{index}"), 4, "x"),
+                "pc-b",
+            );
+            assert!(replies.is_empty(), "offer {index} should be accepted for review");
+        }
+        let replies = mgr.handle_offer(offer_with_id("cap-overflow", 4, "x"), "pc-b");
+        assert!(
+            matches!(
+                replies.first(),
+                Some(Message::FileTransferReject { reason: Some(reason), .. })
+                    if reason.contains("too many")
+            ),
+            "extra offers must be rejected: {replies:?}"
+        );
+        assert!(!dir.path().join("note.txt.cap-overflow.part").exists());
+    }
+
+    #[test]
+    fn disconnect_cleans_up_partial_files() {
+        let dir = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: true,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("disconnect-1", 8, "x"), "pc-b");
+        mgr.handle_chunk(FileChunk {
+            transfer_id: "disconnect-1".into(),
+            offset: 0,
+            data: b"part".to_vec(),
+            last: false,
+        })
+        .unwrap();
+        assert!(dir.path().join("note.txt.disconnect-1.part").exists());
+
+        mgr.cleanup_disconnected_peer();
+
+        assert!(!dir.path().join("note.txt.disconnect-1.part").exists());
+        let record = mgr
+            .history()
+            .iter()
+            .find(|r| r.transfer_id == "disconnect-1")
+            .expect("history keeps the interrupted transfer");
+        assert_eq!(record.state, TransferState::Cancelled);
     }
 }

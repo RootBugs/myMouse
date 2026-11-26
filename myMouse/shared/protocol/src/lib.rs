@@ -1,3 +1,4 @@
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -157,7 +158,17 @@ pub fn decode(bytes: &[u8]) -> ProtocolResult<Message> {
     if body.len() > MAX_BODY_LEN {
         return Err(ProtocolError::TooLarge);
     }
-    let message: Message = bincode::deserialize(body).map_err(|_| ProtocolError::InvalidPayload)?;
+    // Bound bincode's internal allocations by the bytes actually received.
+    // bincode 1.3's slice `deserialize` discards `with_limit`, so decode from
+    // a Cursor instead; that path honours the configured byte budget.
+    let message: Message = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(body.len() as u64)
+        .deserialize_from(std::io::Cursor::new(body))
+        .map_err(|error| match *error {
+            bincode::ErrorKind::SizeLimit => ProtocolError::TooLarge,
+            _ => ProtocolError::InvalidPayload,
+        })?;
     if let Message::Hello { version, .. } = &message {
         if *version != PROTOCOL_VERSION {
             return Err(ProtocolError::VersionMismatch);
@@ -169,6 +180,34 @@ pub fn decode(bytes: &[u8]) -> ProtocolResult<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_rejects_declared_length_larger_than_body() {
+        let mut bytes = encode(&Message::FileTransferChunk(FileChunk {
+            transfer_id: "t".into(),
+            offset: 0,
+            data: vec![0; 4],
+            last: true,
+        }));
+        // Body layout: variant (4) + id length (8) + id (1) + offset (8),
+        // then the 8-byte length prefix for `data`.
+        let prefix_at = PROTOCOL_HEADER_LEN + 4 + 8 + 1 + 8;
+        bytes[prefix_at..prefix_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        // The frame itself is small; only the internal length is bogus. The
+        // decoder must reject it without trusting the declared allocation.
+        assert_eq!(decode(&bytes), Err(ProtocolError::TooLarge));
+    }
+
+    #[test]
+    fn decode_rejects_huge_string_length_without_allocating() {
+        let mut bytes = encode(&Message::Error {
+            message: "x".into(),
+        });
+        // Body: variant (4), then the String length prefix (8).
+        let prefix_at = PROTOCOL_HEADER_LEN + 4;
+        bytes[prefix_at..prefix_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(decode(&bytes), Err(ProtocolError::TooLarge));
+    }
 
     #[test]
     fn hello_round_trip() {
@@ -205,10 +244,12 @@ mod tests {
     #[test]
     fn rejects_truncated_and_garbage_without_panicking() {
         assert_eq!(decode(&[1]).unwrap_err(), ProtocolError::TooShort);
-        assert_eq!(
-            decode(&[PROTOCOL_VERSION as u8, 0, 0xff, 0xff, 0x00]).unwrap_err(),
-            ProtocolError::InvalidPayload
-        );
+        // A truncated/invalid frame must be rejected cleanly; the exact
+        // error depends on whether the byte budget or the reader hits EOF.
+        assert!(matches!(
+            decode(&[PROTOCOL_VERSION as u8, 0, 0xff, 0xff, 0x00]),
+            Err(ProtocolError::InvalidPayload | ProtocolError::TooLarge)
+        ));
     }
 
     #[test]
