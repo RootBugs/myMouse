@@ -1,4 +1,5 @@
 mod clipboard;
+mod device;
 mod discovery;
 mod file_transfer;
 mod identity;
@@ -11,6 +12,7 @@ mod transport;
 mod trust;
 
 use clipboard::{ClipboardManager, ClipboardMode, ClipboardSettings, ClipboardSnapshot};
+use device::DeviceInfo;
 use file_transfer::{FileTransferManager, FileTransferSettings};
 use identity::Identity;
 use input::InputBridge;
@@ -50,6 +52,7 @@ fn default_true() -> bool {
 
 struct AppState {
     device_id: String,
+    device_name: String,
     settings: AppSettings,
     trust: TrustStore,
     clipboard: ClipboardManager,
@@ -69,21 +72,34 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(config_dir: PathBuf) -> Self {
-        Self::with_device_id(config_dir, "local-pc".to_string())
+    fn new(config_dir: PathBuf) -> Result<Self, String> {
+        let device = DeviceInfo::load_or_create(&config_dir)
+            .map_err(|error| format!("could not load device identity: {error}"))?;
+        Ok(Self::with_device_info(config_dir, device))
     }
 
     fn with_device_id(config_dir: PathBuf, device_id: String) -> Self {
+        Self::with_device_info(
+            config_dir,
+            DeviceInfo {
+                id: device_id.clone(),
+                name: device_id,
+            },
+        )
+    }
+
+    fn with_device_info(config_dir: PathBuf, device: DeviceInfo) -> Self {
         let settings_path = config_dir.join("settings.json");
         let settings: AppSettings = std::fs::read_to_string(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let trust = TrustStore::load(config_dir.join("trust.json"));
-        let clipboard = ClipboardManager::new(device_id.clone(), settings.clipboard.clone());
-        let transfers = FileTransferManager::new(device_id.clone(), settings.file_transfer.clone());
+        let clipboard = ClipboardManager::new(device.id.clone(), settings.clipboard.clone());
+        let transfers = FileTransferManager::new(device.id.clone(), settings.file_transfer.clone());
         Self {
-            device_id,
+            device_id: device.id,
+            device_name: device.name,
             settings,
             trust,
             clipboard,
@@ -203,7 +219,7 @@ fn hello_message(state: &Arc<Mutex<AppState>>) -> Message {
     Message::Hello {
         version: PROTOCOL_VERSION,
         device_id: st.device_id.clone(),
-        name: st.device_id.clone(),
+        name: st.device_name.clone(),
     }
 }
 
@@ -232,6 +248,7 @@ async fn handle_request(
                 json!({
                     "ok": true,
                     "deviceId": st.device_id,
+                    "name": st.device_name,
                     "fingerprint": st.identity_fingerprint,
                     "listenPort": st.listen_port,
                 }),
@@ -476,8 +493,11 @@ async fn handle_request(
         "stopInput" | "emergencyStop" => {
             network.set_input_enabled(false);
             if let Ok(mut bridge) = state.lock().unwrap().input_bridge.lock() {
-                bridge.stop();
+                // Pause keeps the OS hooks installed but passes all input
+                // through. Stopping the hooks here made resume impossible.
+                bridge.pause();
             };
+            InputBridge::release_modifiers();
             emit(json!({
                 "notification": "inputState",
                 "enabled": false,
@@ -488,7 +508,7 @@ async fn handle_request(
         "resumeInput" => {
             network.set_input_enabled(true);
             if let Ok(mut bridge) = state.lock().unwrap().input_bridge.lock() {
-                bridge.forwarding = true;
+                bridge.resume();
             };
             emit(json!({
                 "notification": "inputState",
@@ -743,7 +763,7 @@ async fn accept_inbound_loop(
 
 async fn run_ipc() -> Result<(), String> {
     let config = config_dir();
-    let state = Arc::new(Mutex::new(AppState::new(config.clone())));
+    let state = Arc::new(Mutex::new(AppState::new(config.clone())?));
     let device_id = state.lock().unwrap().device_id.clone();
     let input_gate = Arc::new(AtomicBool::new(true));
     let network = network::start(
@@ -766,10 +786,11 @@ async fn run_ipc() -> Result<(), String> {
         }
     });
     let gate_network = network.clone();
-    let bridge = Arc::new(Mutex::new(InputBridge::with_connection_gate(
-        &device_id,
+    let active_peer_id = network.active_peer_id();
+    let bridge = Arc::new(Mutex::new(InputBridge::with_target_provider(
         input_tx,
         Arc::new(move || gate_network.connected_now()),
+        Arc::new(move || active_peer_id.lock().unwrap().clone()),
     )));
     // Forwarding stays armed, but the hooks only swallow local input once a
     // peer is actually connected. On a fresh install with no peer, input must
@@ -832,8 +853,9 @@ async fn run_ipc() -> Result<(), String> {
 
     // Advertising the real listener and fingerprint over mDNS gives the UI a
     // peer to pair with; the fingerprint still requires out-of-band approval.
+    let device_name = state.lock().unwrap().device_name.clone();
     if let Ok(mut discovered) =
-        discovery::Discovery::new(&device_id, &device_id).start(listen_port, identity.fingerprint())
+        discovery::Discovery::new(&device_id, &device_name).start(listen_port, identity.fingerprint())
     {
         let discovery_state = state.clone();
         tokio::spawn(async move {
@@ -912,6 +934,20 @@ mod tests {
     #[test]
     fn scaffold_compiles() {
         assert_eq!(env!("CARGO_PKG_NAME"), "mymouse-backend");
+    }
+
+    #[test]
+    fn production_device_id_is_unique_and_persisted() {
+        // Regression: every install used the shared ID "local-pc", so mDNS
+        // self-filtered peers and trust/pinning collapsed onto one identity.
+        let dir = tempfile::tempdir().unwrap();
+        let first = AppState::new(dir.path().to_path_buf()).unwrap();
+        assert!(is_valid_id(&first.device_id));
+        assert_ne!(first.device_id, "local-pc");
+        let saved = std::fs::read_to_string(dir.path().join("device.json")).unwrap();
+        assert!(saved.contains(&first.device_id));
+        let second = AppState::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(second.device_id, first.device_id);
     }
 
     #[test]

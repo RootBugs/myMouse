@@ -96,6 +96,7 @@ struct Connection {
     tx: mpsc::UnboundedSender<OutgoingFrame>,
     tasks: Vec<JoinHandle<()>>,
     generation: u64,
+    peer_device_id: String,
 }
 
 enum RuntimeCommand {
@@ -133,6 +134,10 @@ pub struct PeerRuntimeHandle {
     /// Synchronous mirror of the connection table for the OS input hook: local
     /// events are only swallowed when there is actually a peer to send to.
     peer_connected: Arc<AtomicBool>,
+    /// Synchronous view of the peer selected for outbound messages. The input
+    /// bridge reads this so frames are addressed to the actual peer, never to
+    /// this machine's own device ID.
+    active_peer_id: Arc<Mutex<Option<String>>>,
 }
 
 impl PeerRuntimeHandle {
@@ -154,6 +159,11 @@ impl PeerRuntimeHandle {
     /// Hook-safe, non-async view of whether any peer is attached.
     pub fn connected_now(&self) -> bool {
         self.peer_connected.load(Ordering::SeqCst)
+    }
+
+    /// Shared slot naming the peer that will receive outbound frames.
+    pub fn active_peer_id(&self) -> Arc<Mutex<Option<String>>> {
+        self.active_peer_id.clone()
     }
 
     /// Queue a message for the connected peer. The ack resolves after the
@@ -257,6 +267,7 @@ struct PeerRuntime {
     active_outbound_generation: u64,
     input_gate: Arc<AtomicBool>,
     peer_connected: Arc<AtomicBool>,
+    active_peer_id: Arc<Mutex<Option<String>>>,
     last_input_window: Instant,
     input_events_in_window: usize,
 }
@@ -272,11 +283,13 @@ impl PeerRuntime {
         let (command_sender, commands) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let peer_connected = Arc::new(AtomicBool::new(false));
+        let active_peer_id = Arc::new(Mutex::new(None));
         let handle = PeerRuntimeHandle {
             commands: command_sender.clone(),
             identity: Arc::new(Mutex::new(None)),
             input_gate: input_gate.clone(),
             peer_connected: peer_connected.clone(),
+            active_peer_id: active_peer_id.clone(),
         };
         tokio::spawn(async move {
             let mut runtime = Self {
@@ -294,6 +307,7 @@ impl PeerRuntime {
                 active_outbound_generation: 0,
                 input_gate,
                 peer_connected,
+                active_peer_id,
                 last_input_window: Instant::now(),
                 input_events_in_window: 0,
             };
@@ -375,10 +389,12 @@ impl PeerRuntime {
                         tx,
                         tasks,
                         generation,
+                        peer_device_id: peer_device_id.clone(),
                     },
                 );
-                self.peer_device_id = peer_device_id;
+                self.peer_device_id = peer_device_id.clone();
                 self.peer_connected.store(true, Ordering::SeqCst);
+                *self.active_peer_id.lock().unwrap() = Some(peer_device_id);
                 let _ = ack.send(());
             }
             RuntimeCommand::AttachInbound {
@@ -394,7 +410,7 @@ impl PeerRuntime {
                     stream,
                     key,
                     generation,
-                    peer_device_id,
+                    peer_device_id.clone(),
                     self.inbound_tx.clone(),
                     self.command_sender.clone(),
                 );
@@ -404,9 +420,13 @@ impl PeerRuntime {
                         tx,
                         tasks,
                         generation,
+                        peer_device_id: peer_device_id.clone(),
                     },
                 );
                 self.peer_connected.store(true, Ordering::SeqCst);
+                if !self.connections.contains_key(&PeerKey::Outbound) {
+                    *self.active_peer_id.lock().unwrap() = Some(peer_device_id);
+                }
                 let _ = ack.send(());
             }
             RuntimeCommand::ConnectionClosed { key, generation } => {
@@ -426,8 +446,16 @@ impl PeerRuntime {
                         // No peer left: release local input immediately instead
                         // of leaving the OS hooks swallowing every event.
                         self.peer_connected.store(false, Ordering::SeqCst);
+                        *self.active_peer_id.lock().unwrap() = None;
                         let mut state = self.state.lock().unwrap();
                         state.transfers.cleanup_disconnected_peer();
+                    } else {
+                        let next = self
+                            .connections
+                            .get(&PeerKey::Outbound)
+                            .or_else(|| self.connections.values().next())
+                            .map(|connection| connection.peer_device_id.clone());
+                        *self.active_peer_id.lock().unwrap() = next;
                     }
                 }
             }
@@ -436,6 +464,7 @@ impl PeerRuntime {
             }
             RuntimeCommand::Shutdown => {
                 self.peer_connected.store(false, Ordering::SeqCst);
+                *self.active_peer_id.lock().unwrap() = None;
             }
         }
     }
@@ -662,6 +691,8 @@ impl PeerRuntime {
                     "kind": match &event {
                         CapturedEvent::Key { .. } => "key",
                         CapturedEvent::MouseMove { .. } => "mouse",
+                        CapturedEvent::MouseButton { .. } => "mouseButton",
+                        CapturedEvent::MouseWheel { .. } => "wheel",
                         CapturedEvent::Hotkey(_) => "hotkey",
                     },
                     "payloadBytes": payload_bytes,
@@ -783,6 +814,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            down: true,
         };
         assert!(can_inject(
             Some(&caps()),

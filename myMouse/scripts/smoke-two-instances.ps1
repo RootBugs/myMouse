@@ -12,7 +12,10 @@ if (-not (Test-Path $exe)) {
   throw "Backend binary not found at '$exe'."
 }
 
-$logDir = Join-Path $projectDir 'backend\target\smoke-logs'
+# Each run gets its own directory. PowerShell keeps redirected stdout handles
+# alive briefly after the child exits, so reusing fixed log paths makes rapid
+# back-to-back runs race on Set-Content.
+$logDir = Join-Path $projectDir ('backend\target\smoke-logs\' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $outA = Join-Path $logDir 'pc-a.out'
 $errA = Join-Path $logDir 'pc-a.err'
@@ -93,8 +96,13 @@ try {
 }
 finally {
   foreach ($process in @($pA, $pB)) {
-    if ($process -and -not $process.HasExited) {
-      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    if ($process) {
+      if (-not $process.HasExited) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      }
+      # Stop-Process only signals the child. Wait for its redirected stdout
+      # handle to close so an immediate rerun can truncate the log files.
+      $process.WaitForExit(5000) | Out-Null
     }
   }
 }

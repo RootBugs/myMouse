@@ -5,11 +5,13 @@ nearby computers, with its own protocol, trust store, and interface. It is a
 from-scratch alternative, not a wrapper around any installed application.
 
 **Runtime-verified scope: Windows host ↔ Windows target, driven by the
-two-instance pinned-TLS harness on this host.** Clipboard updates and small
-file transfers now travel between two real backend processes over the existing
-v2 pinned-TLS transport; the UI sends clipboard text and offers/accepts files and
-refreshes on backend notifications. No two *separate physical* PCs were available
-here, so that remains harness-verified rather than field-verified.
+two-instance pinned-TLS harness on this host.** Clipboard updates, small file
+transfers, and a synthetic cursor crossing travel between two real backend
+processes over the existing v2 pinned-TLS transport; the UI sends clipboard text
+and offers/accepts files and refreshes on backend notifications. No two *separate
+physical* PCs were available here, so that remains harness-verified rather than
+field-verified. Live production edge-crossing handoff is not wired yet; see the
+[Phase 1 audit](docs/phase1-audit.md).
 
 Android (`apps/android/`) and the Rust FFI crate (`shared/android-bridge/`) are
 **Phase 3 scaffolds / source-complete but source-only**: no Android SDK/NDK/Gradle
@@ -24,11 +26,18 @@ is provided.
 
 - Electron + React desktop UI with a device dashboard, adjacency layout editor,
   and device-management panel.
+- Persistent per-install identity: a stable UUID and system-derived device name
+  are stored in `device.json`. `Hello`, `localIdentity`, and mDNS discovery carry
+  the real name; production input events are stamped with the connected peer's
+  device ID.
 - Rust backend with a versioned binary protocol, LAN (mDNS) discovery that
   advertises the real TLS listener port and certificate fingerprint, QR /
   six-digit or discovery-based `pairDiscovered` approval, pinned TLS 1.3 per
   pair, an adjacency layout model, and Windows low-level input capture/
-  injection.
+  injection. Captured events cover key down/up, mouse buttons (including X1/X2),
+  and wheel input; capture and injection share canonical key names for modifiers,
+  navigation, F1–F24, and exact `VK(n)` values. Remote hotkey events are rejected
+  from the wire.
 - Two-instance end-to-end tests that link two backend processes over pinned TLS
   and verify a cursor crossing, exact clipboard text delivery, and exact file
   bytes (offer → accept → chunks → complete).
@@ -138,16 +147,19 @@ it, it will require your explicit action.
 
 ## Control and layout
 
-- Each physical monitor is a node. Arrange nodes in an adjacency grid; edges
-  define handoff. There is no wrap by default.
-- A cursor crossing a configured edge hands control to the adjacent machine
-  exactly once, scaling the entry coordinate for the target display.
+- Each physical monitor is a node. The adjacency layout editor models nodes and
+  edges; production layout persistence (`setLayout`) and live edge-crossing
+  handoff are still pending, so the layout view is currently static.
+- `Layout::cross()` implements and unit-tests edge-crossing math. The
+  two-instance harness verifies a synthetic crossing forwarded to one peer over
+  pinned TLS, but no live Windows cursor boundary is wired yet.
 - Only one input source is active at a time. Injected events are filtered from
   capture so control cannot loop back.
-- **Emergency stop:** Dashboard → **Emergency stop** immediately closes the
-  input gate and releases held modifiers, returning control to the local host.
-  **Resume input** reopens it. Remote hotkey events are rejected from the wire;
-  a local hotkey is the only escape path and is never trusted from a peer.
+- **Emergency stop:** Dashboard → **Emergency stop** pauses capture without
+  unhooking OS hooks and releases held modifiers, returning control to the local
+  host. **Resume input** resumes capture cleanly. Remote hotkey events are
+  rejected from the wire; a local hotkey is the only escape path and is never
+  trusted from a peer.
 
 ## Trust management
 
@@ -176,7 +188,12 @@ See [docs/limitations.md](docs/limitations.md). In short:
   is configured at the rustls builder level; no live TLS 1.2 downgrade attempt
   was executed here. OS-level `SendInput` behaviour is covered by code paths and
   test-mode notifications, not by a hardware-level audit.
-- Complex keyboard layouts, IMEs, and per-monitor DPI handoff are not complete.
+- Windows capture/injection now maps key down/up, mouse buttons (including
+  X1/X2), wheel events, canonical modifier/navigation/function keys, and exact
+  `VK(n)` values. Complex layouts, IMEs, dead keys, per-monitor DPI compensation,
+  and live production cursor handoff remain incomplete.
+- Production `setLayout` is still a no-op and the React layout view is static;
+  only unit-tested crossing math and the synthetic harness crossing exist today.
 - Android is source-only with a real pinned-TLS bridge implementation (no APK
   or device test: no Android SDK/NDK/Gradle); Mac is source-only on Windows.
 - Builds are unsigned; autostart is off until you enable it.

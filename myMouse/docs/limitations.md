@@ -1,15 +1,25 @@
 # myMouse — known limitations
 
-Last accuracy pass: 2026-11-26. Scope statements below distinguish what was
-**verified on this Windows host** from what is only source-complete.
+Last accuracy pass: 2026-11-27. Scope statements below distinguish what was
+**verified on this Windows host** from what is only source-complete. See
+[phase1-audit.md](phase1-audit.md) for the full status inventory.
 
 ## Input capture and injection
 
 - **UAC prompts, the secure desktop, and locked sessions are out of scope for v1.** Windows does not deliver low-level input hooks to processes running at a different integrity level or on the secure desktop. myMouse will not inject into those surfaces. Unlock the PC and use the local keyboard/mouse there.
-- **Emergency stop** (Dashboard → **Emergency stop**) immediately closes the injection gate and releases held modifiers so control returns to the host. **Resume input** reopens it. Hotkey events are rejected from the wire; only a locally captured hotkey can trigger the escape, and no raw keystroke bytes are logged in input notifications.
+- **Emergency stop** (Dashboard → **Emergency stop**) pauses input capture without unhooking OS hooks and releases held modifiers so control returns to the host. **Resume input** reopens capture cleanly. Hotkey events are rejected from the wire; only a locally captured hotkey can trigger the escape, and no raw keystroke bytes are logged in input notifications.
 - Only one input source is active at a time. Locally captured events are forwarded while forwarding is active; remote events from the peer are applied with `SendInput` only when the gate is open, the target exactly matches this device, capability is granted, and the 250 events/s budget is not exceeded. Injected events are filtered from the capture hooks to prevent loops. These gates are code/test verified; no hardware-level injection audit was performed here.
-- Text translation for macOS targets currently covers the Ctrl→Cmd / Alt→Option modifier mapping. Complex layouts, IMEs, dead keys, and non-alphanumeric special keys are not yet fully mapped.
+- Windows capture/injection now share one key vocabulary: modifiers, navigation
+  keys, F1–F24, common special keys, and exact `VK(n)` values (`1..=255`) map to
+  stable names in both directions. Key down/up, mouse buttons (including X1/X2),
+  and wheel events are represented explicitly. Complex layouts, IMEs, and dead
+  keys remain incomplete, and macOS translation still covers only Ctrl→Cmd /
+  Alt→Option.
 - Mouse injection uses absolute virtual-screen coordinates. Multi-monitor layouts are modelled, but per-monitor DPI scaling at handoff is not yet compensated for.
+- Production edge detection and cursor handoff are **not wired**: `setLayout` is
+  a no-op, the React layout view is static, and no live Windows mouse-hook
+  crossing sends control to a peer. The two-instance harness verifies a
+  synthetic crossing over pinned TLS only.
 
 ## Clipboard and file transfer
 

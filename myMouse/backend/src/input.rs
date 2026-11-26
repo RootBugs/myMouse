@@ -11,6 +11,15 @@ use tokio::task::JoinHandle;
 /// `Hotkey` keeps a `&'static str` in the public API; deserialization maps the
 /// known wire strings back to static values so no untrusted string is leaked
 /// into a long-lived allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum CapturedEvent {
     Key {
@@ -18,9 +27,22 @@ pub enum CapturedEvent {
         ctrl: bool,
         alt: bool,
         shift: bool,
+        down: bool,
     },
     Hotkey(&'static str),
     MouseMove { x: i32, y: i32 },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+        x: i32,
+        y: i32,
+    },
+    MouseWheel {
+        /// Signed notches; positive scrolls up, negative scrolls down.
+        delta: i32,
+        x: i32,
+        y: i32,
+    },
 }
 
 impl<'de> Deserialize<'de> for CapturedEvent {
@@ -32,9 +54,17 @@ impl<'de> Deserialize<'de> for CapturedEvent {
                 ctrl: bool,
                 alt: bool,
                 shift: bool,
+                down: bool,
             },
             Hotkey(String),
             MouseMove { x: i32, y: i32 },
+            MouseButton {
+                button: MouseButton,
+                down: bool,
+                x: i32,
+                y: i32,
+            },
+            MouseWheel { delta: i32, x: i32, y: i32 },
         }
 
         match WireEvent::deserialize(deserializer)? {
@@ -43,18 +73,113 @@ impl<'de> Deserialize<'de> for CapturedEvent {
                 ctrl,
                 alt,
                 shift,
+                down,
             } => Ok(CapturedEvent::Key {
                 key,
                 ctrl,
                 alt,
                 shift,
+                down,
             }),
             // Hotkeys are local control signals only. A peer must never be
             // able to synthesise our escape sequence and release host
             // modifiers or type a key.
             WireEvent::Hotkey(_) => Err(D::Error::custom("hotkeys cannot be received from a peer")),
             WireEvent::MouseMove { x, y } => Ok(CapturedEvent::MouseMove { x, y }),
+            WireEvent::MouseButton {
+                button,
+                down,
+                x,
+                y,
+            } => Ok(CapturedEvent::MouseButton {
+                button,
+                down,
+                x,
+                y,
+            }),
+            WireEvent::MouseWheel { delta, x, y } => {
+                Ok(CapturedEvent::MouseWheel { delta, x, y })
+            }
         }
+    }
+}
+
+/// Map a stable key name to a Win32 virtual-key code. Names are produced by
+/// the capture hook and are intentionally independent of the source keyboard
+/// layout; the receiver maps them to its own scancodes.
+fn virtual_key(name: &str) -> u16 {
+    const TABLE: &[(&str, u16)] = &[
+        ("Backspace", 0x08),
+        ("Tab", 0x09),
+        ("Enter", 0x0D),
+        ("Shift", 0x10),
+        ("Ctrl", 0x11),
+        ("Alt", 0x12),
+        ("Escape", 0x1B),
+        ("Space", 0x20),
+        ("PageUp", 0x21),
+        ("PageDown", 0x22),
+        ("End", 0x23),
+        ("Home", 0x24),
+        ("Left", 0x25),
+        ("Up", 0x26),
+        ("Right", 0x27),
+        ("Down", 0x28),
+        ("Insert", 0x2D),
+        ("Delete", 0x2E),
+    ];
+    if let Some((_, vk)) = TABLE.iter().find(|(key, _)| *key == name) {
+        return *vk;
+    }
+    if let Some(func) = name.strip_prefix('F') {
+        if let Ok(n) = func.parse::<u16>() {
+            if (1..=24).contains(&n) {
+                return 0x6F + n;
+            }
+        }
+    }
+    // Capture emits `VK(n)` when a key has no stable printable name. Parse the
+    // whole number instead of falling through to the leading `V` (VK 0x56),
+    // and reject out-of-range values from an untrusted peer.
+    if let Some(raw) = name
+        .strip_prefix("VK(")
+        .and_then(|suffix| suffix.strip_suffix(')'))
+    {
+        if let Ok(vk) = raw.parse::<u16>() {
+            if (1..=255).contains(&vk) {
+                return vk;
+            }
+        }
+        return 0;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => c.to_ascii_uppercase() as u16,
+        _ => 0,
+    }
+}
+
+const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
+const MOUSEEVENTF_LEFTUP: u32 = 0x0004;
+const MOUSEEVENTF_RIGHTDOWN: u32 = 0x0008;
+const MOUSEEVENTF_RIGHTUP: u32 = 0x0010;
+const MOUSEEVENTF_MIDDLEDOWN: u32 = 0x0020;
+const MOUSEEVENTF_MIDDLEUP: u32 = 0x0040;
+const MOUSEEVENTF_XDOWN: u32 = 0x0080;
+const MOUSEEVENTF_XUP: u32 = 0x0100;
+const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+
+fn mouse_button_flags(button: MouseButton, down: bool) -> u32 {
+    match (button, down) {
+        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+        (MouseButton::X1, true) | (MouseButton::X2, true) => MOUSEEVENTF_XDOWN,
+        (MouseButton::X1, false) | (MouseButton::X2, false) => MOUSEEVENTF_XUP,
     }
 }
 
@@ -71,6 +196,7 @@ pub fn translate(event: &CapturedEvent, target_os: &str) -> Option<TranslatedEve
         ctrl,
         alt,
         shift,
+        ..
     } = event
     else {
         return None;
@@ -120,9 +246,11 @@ pub fn set_stop_callback(callback: Arc<dyn Fn() + Send + Sync>) {
     let _ = STOP_CALLBACK.set(callback);
 }
 
+type TargetProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 pub struct InputBridge {
     pub forwarding: bool,
-    pub target: String,
+    target_provider: TargetProvider,
     outgoing: Option<mpsc::UnboundedSender<Message>>,
     /// Production gate: local input is only consumed when a peer is actually
     /// connected. Test mode leaves this unset and keeps its existing behavior.
@@ -139,7 +267,7 @@ impl InputBridge {
     pub fn new() -> Self {
         Self {
             forwarding: false,
-            target: String::new(),
+            target_provider: Arc::new(|| None),
             outgoing: None,
             connection_gate: None,
         }
@@ -151,16 +279,33 @@ impl InputBridge {
         Self::with_connection_gate(target, outgoing, Arc::new(|| true))
     }
 
-    /// Production constructor. `gate` must report whether a peer is connected;
-    /// without one the OS hooks would swallow local input even with no peer.
+    /// Constructor for a fixed target, used by tests and the deterministic
+    /// two-instance harness. Production must use `with_target_provider`.
     pub fn with_connection_gate(
         target: &str,
         outgoing: mpsc::UnboundedSender<Message>,
         gate: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
+        let fixed_target = target.to_string();
+        Self::with_target_provider(
+            outgoing,
+            gate,
+            Arc::new(move || Some(fixed_target.clone())),
+        )
+    }
+
+    /// Production constructor. `gate` reports whether a peer is connected and
+    /// `target_provider` reports the currently connected peer's device ID.
+    /// Captured events must never be stamped with the local device ID: the
+    /// receiver rejects frames whose target is not itself.
+    pub fn with_target_provider(
+        outgoing: mpsc::UnboundedSender<Message>,
+        gate: Arc<dyn Fn() -> bool + Send + Sync>,
+        target_provider: TargetProvider,
+    ) -> Self {
         Self {
             forwarding: false,
-            target: target.to_string(),
+            target_provider,
             outgoing: Some(outgoing),
             connection_gate: Some(gate),
         }
@@ -197,15 +342,26 @@ impl InputBridge {
             return false;
         }
 
+        let Some(target) = (self.target_provider)() else {
+            return false;
+        };
         let Some(outgoing) = &self.outgoing else {
             return false;
         };
         let payload = bincode::serialize(&event).unwrap_or_default();
-        let _ = outgoing.send(Message::InputEvent {
-            target: self.target.clone(),
-            payload,
-        });
+        let _ = outgoing.send(Message::InputEvent { target, payload });
         true
+    }
+
+    /// Emergency pause: close local capture without tearing down the OS hooks.
+    /// The hooks stay installed but pass every event through until `resume`.
+    pub fn pause(&mut self) {
+        self.forwarding = false;
+    }
+
+    /// Re-enable local capture after `pause` without restarting the process.
+    pub fn resume(&mut self) {
+        self.forwarding = true;
     }
 
     /// Apply an event received from a peer on the local machine. Local escape
@@ -259,7 +415,8 @@ mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MapVirtualKeyW, SendInput, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
         KEYEVENTF_KEYUP, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE,
-        MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, VIRTUAL_KEY, INPUT,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSE_EVENT_FLAGS, MOUSEINPUT, VIRTUAL_KEY,
+        INPUT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, GetSystemMetrics, SetWindowsHookExW, TranslateMessage,
@@ -282,6 +439,9 @@ mod win {
     // and the stop() call site touch the list.
     static HOOKS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
     static MODIFIERS: AtomicU8 = AtomicU8::new(0);
+    /// Modifier state already injected on the target machine. Only transitions
+    /// are sent so held modifiers survive across separate key events.
+    static TARGET_MODIFIERS: AtomicU8 = AtomicU8::new(0);
 
     struct HookGuard(Vec<isize>);
 
@@ -296,6 +456,31 @@ mod win {
     }
 
     fn key_name(vk: u32) -> String {
+        // Named keys must have the same stable names `virtual_key` decodes;
+        // otherwise an F-key or modifier is injected as a completely
+        // different key on the target.
+        match vk {
+            8 => return "Backspace".into(),
+            9 => return "Tab".into(),
+            13 => return "Enter".into(),
+            16 => return "Shift".into(),
+            17 => return "Ctrl".into(),
+            18 => return "Alt".into(),
+            27 => return "Escape".into(),
+            32 => return "Space".into(),
+            33 => return "PageUp".into(),
+            34 => return "PageDown".into(),
+            35 => return "End".into(),
+            36 => return "Home".into(),
+            37 => return "Left".into(),
+            38 => return "Up".into(),
+            39 => return "Right".into(),
+            40 => return "Down".into(),
+            45 => return "Insert".into(),
+            46 => return "Delete".into(),
+            112..=135 => return format!("F{}", vk - 111),
+            _ => {}
+        }
         let mapped = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) };
         let ch = char::from_u32(mapped & 0xffff)
             .filter(|c| !c.is_control())
@@ -303,19 +488,7 @@ mod win {
         if ch.is_alphanumeric() {
             return ch.to_ascii_uppercase().to_string();
         }
-        match vk {
-            8 => "Backspace".into(),
-            9 => "Tab".into(),
-            13 => "Enter".into(),
-            27 => "Escape".into(),
-            32 => "Space".into(),
-            37 => "Left".into(),
-            38 => "Up".into(),
-            39 => "Right".into(),
-            40 => "Down".into(),
-            46 => "Delete".into(),
-            _ => format!("VK({vk})"),
-        }
+        format!("VK({vk})")
     }
 
     unsafe extern "system" fn keyboard_proc(
@@ -344,22 +517,26 @@ mod win {
                     MODIFIERS.store(if down { old | bit } else { old & !bit }, Ordering::SeqCst);
                 }
 
-                if down {
-                    let flags = MODIFIERS.load(Ordering::SeqCst);
-                    let event = if info.vkCode == VK_M
-                        && flags & (MOD_CTRL | MOD_ALT | MOD_SHIFT)
-                            == (MOD_CTRL | MOD_ALT | MOD_SHIFT)
-                    {
-                        CapturedEvent::Hotkey(escape_hotkey())
-                    } else {
-                        CapturedEvent::Key {
-                            key: key_name(info.vkCode),
-                            ctrl: flags & MOD_CTRL != 0,
-                            alt: flags & MOD_ALT != 0,
-                            shift: flags & MOD_SHIFT != 0,
-                        }
-                    };
+                let flags = MODIFIERS.load(Ordering::SeqCst);
+                // The escape hotkey is a local control signal: fire once on
+                // press, never on release, and never send it to the peer.
+                let event = if down
+                    && info.vkCode == VK_M
+                    && flags & (MOD_CTRL | MOD_ALT | MOD_SHIFT)
+                        == (MOD_CTRL | MOD_ALT | MOD_SHIFT)
+                {
+                    Some(CapturedEvent::Hotkey(escape_hotkey()))
+                } else {
+                    Some(CapturedEvent::Key {
+                        key: key_name(info.vkCode),
+                        ctrl: flags & MOD_CTRL != 0,
+                        alt: flags & MOD_ALT != 0,
+                        shift: flags & MOD_SHIFT != 0,
+                        down,
+                    })
+                };
 
+                if let Some(event) = event {
                     if let Some(bridge) = BRIDGE.get() {
                         let mut bridge = bridge.lock().unwrap();
                         if bridge.handle(event) {
@@ -373,19 +550,74 @@ mod win {
     }
 
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        const WM_LBUTTONDOWN: u32 = 0x0201;
+        const WM_LBUTTONUP: u32 = 0x0202;
+        const WM_RBUTTONDOWN: u32 = 0x0204;
+        const WM_RBUTTONUP: u32 = 0x0205;
+        const WM_MBUTTONDOWN: u32 = 0x0207;
+        const WM_MBUTTONUP: u32 = 0x0208;
+        const WM_MOUSEWHEEL: u32 = 0x020A;
+        const WM_XBUTTONDOWN: u32 = 0x020B;
+        const WM_XBUTTONUP: u32 = 0x020C;
+        const WM_MOUSEHWHEEL: u32 = 0x020E;
+
         let is_action = code as u32 == HC_ACTION;
-        if is_action && wparam.0 as u32 == WM_MOUSEMOVE && lparam.0 != 0 {
+        if is_action && lparam.0 != 0 {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
             let injected = (info.flags & 0x01) != 0 || (info.dwExtraInfo & 0x1) != 0;
             if !injected {
-                let event = CapturedEvent::MouseMove {
-                    x: info.pt.x,
-                    y: info.pt.y,
+                let message = wparam.0 as u32;
+                let event = match message {
+                    WM_MOUSEMOVE => Some(CapturedEvent::MouseMove {
+                        x: info.pt.x,
+                        y: info.pt.y,
+                    }),
+                    WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+                    | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                        let (button, down) = match message {
+                            WM_LBUTTONDOWN => (MouseButton::Left, true),
+                            WM_LBUTTONUP => (MouseButton::Left, false),
+                            WM_RBUTTONDOWN => (MouseButton::Right, true),
+                            WM_RBUTTONUP => (MouseButton::Right, false),
+                            WM_MBUTTONDOWN => (MouseButton::Middle, true),
+                            WM_MBUTTONUP => (MouseButton::Middle, false),
+                            WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                                let extra = (info.mouseData >> 16) as u16;
+                                let button = if extra == 1 {
+                                    MouseButton::X1
+                                } else {
+                                    MouseButton::X2
+                                };
+                                (button, message == WM_XBUTTONDOWN)
+                            }
+                            _ => unreachable!(),
+                        };
+                        Some(CapturedEvent::MouseButton {
+                            button,
+                            down,
+                            x: info.pt.x,
+                            y: info.pt.y,
+                        })
+                    }
+                    WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                        // Mouse wheel delta lives in the high word of mouseData.
+                        // Horizontal wheels are intentionally normalised to a
+                        // vertical event because the wire event has one axis.
+                        let delta = (info.mouseData >> 16) as i16 as i32;
+                        Some(CapturedEvent::MouseWheel {
+                            delta,
+                            x: info.pt.x,
+                            y: info.pt.y,
+                        })
+                    }
+                    _ => None,
                 };
-                if let Some(bridge) = BRIDGE.get() {
-                    let mut bridge = bridge.lock().unwrap();
-                    if bridge.handle(event) {
-                        return LRESULT(1);
+                if let Some(event) = event {
+                    if let Some(bridge) = BRIDGE.get() {
+                        let mut bridge = bridge.lock().unwrap();
+                        if bridge.handle(event) {
+                            return LRESULT(1);
+                        }
                     }
                 }
             }
@@ -424,46 +656,103 @@ mod win {
         })
     }
 
+    fn absolute_move(x: i32, y: i32) -> INPUT {
+        let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+        let mut input = INPUT::default();
+        input.r#type = INPUT_MOUSE;
+        input.Anonymous.mi = MOUSEINPUT {
+            dx: super::normalize_coordinate(i64::from(x), origin_x, width),
+            dy: super::normalize_coordinate(i64::from(y), origin_y, height),
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        input
+    }
+
+    fn key_input(vk: u16, down: bool) -> INPUT {
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 };
+        let mut input = INPUT::default();
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki = KEYBDINPUT {
+            wVk: VIRTUAL_KEY(vk),
+            wScan: scan,
+            dwFlags: if down {
+                KEYBD_EVENT_FLAGS::default()
+            } else {
+                KEYEVENTF_KEYUP
+            },
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        input
+    }
+
     pub(super) fn inject(event: &CapturedEvent) {
         let mut inputs: Vec<INPUT> = Vec::new();
         match event {
-            CapturedEvent::Key { key, .. } => {
-                // A normal key is pressed and released. Hotkeys are local-only.
-                let base = key.rsplit('+').next().unwrap_or(key);
-                let vk = base
-                    .chars()
-                    .next()
-                    .filter(|c| c.is_ascii_alphanumeric())
-                    .map(|c| c.to_ascii_uppercase() as u16)
-                    .unwrap_or(0);
-                let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 };
-                for flags in [KEYBD_EVENT_FLAGS::default(), KEYEVENTF_KEYUP] {
-                    let mut input = INPUT::default();
-                    input.r#type = INPUT_KEYBOARD;
-                    input.Anonymous.ki = KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk),
-                        wScan: scan,
-                        dwFlags: flags,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    };
-                    inputs.push(input);
+            CapturedEvent::Key {
+                key,
+                ctrl,
+                alt,
+                shift,
+                down,
+            } => {
+                // Synchronise target modifiers before delivering the key so a
+                // sequence such as Ctrl-down, C-down, C-up, Ctrl-up works even
+                // though each event crosses the wire independently.
+                let desired = (*ctrl as u8) * 1 + (*alt as u8) * 2 + (*shift as u8) * 4;
+                let current = TARGET_MODIFIERS.swap(desired, Ordering::SeqCst);
+                for (bit, vk) in [(1u8, VK_CONTROL), (2, VK_MENU), (4, VK_SHIFT)] {
+                    let was = current & bit != 0;
+                    let now = desired & bit != 0;
+                    if was != now {
+                        inputs.push(key_input(vk as u16, now));
+                    }
+                }
+                // Modifier keys themselves are already handled above; sending
+                // them again would release them immediately.
+                let vk = super::virtual_key(key);
+                if vk != 0 && !matches!(key.as_str(), "Ctrl" | "Alt" | "Shift") {
+                    inputs.push(key_input(vk, *down));
                 }
             }
             CapturedEvent::Hotkey(_) => return,
             CapturedEvent::MouseMove { x, y } => {
-                // MOUSEEVENTF_ABSOLUTE wants 0..65535 over the virtual screen.
-                let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-                let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-                let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
-                let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+                inputs.push(absolute_move(*x, *y));
+            }
+            CapturedEvent::MouseButton { button, down, x, y } => {
+                inputs.push(absolute_move(*x, *y));
+                let mut input = INPUT::default();
+                input.r#type = INPUT_MOUSE;
+                let data = match button {
+                    MouseButton::X1 => 1,
+                    MouseButton::X2 => 2,
+                    _ => 0,
+                };
+                input.Anonymous.mi = MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: data,
+                    dwFlags: MOUSE_EVENT_FLAGS(super::mouse_button_flags(*button, *down)),
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                inputs.push(input);
+            }
+            CapturedEvent::MouseWheel { delta, x, y } => {
+                inputs.push(absolute_move(*x, *y));
                 let mut input = INPUT::default();
                 input.r#type = INPUT_MOUSE;
                 input.Anonymous.mi = MOUSEINPUT {
-                    dx: super::normalize_coordinate(i64::from(*x), origin_x, width),
-                    dy: super::normalize_coordinate(i64::from(*y), origin_y, height),
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    dx: 0,
+                    dy: 0,
+                    mouseData: *delta as u32,
+                    dwFlags: MOUSE_EVENT_FLAGS(super::MOUSEEVENTF_WHEEL),
                     time: 0,
                     dwExtraInfo: 0,
                 };
@@ -505,6 +794,28 @@ mod win {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn capture_names_special_keys_for_stable_injection() {
+            // Regression: unknown keys became VK(n), so F-keys, Home/End and
+            // modifier keys could not be reliably recreated on the target.
+            assert_eq!(key_name(0x10), "Shift");
+            assert_eq!(key_name(0x11), "Ctrl");
+            assert_eq!(key_name(0x12), "Alt");
+            assert_eq!(key_name(0x70), "F1");
+            assert_eq!(key_name(0x7B), "F12");
+            assert_eq!(key_name(0x87), "F24");
+            assert_eq!(key_name(0x21), "PageUp");
+            assert_eq!(key_name(0x22), "PageDown");
+            assert_eq!(key_name(0x23), "End");
+            assert_eq!(key_name(0x24), "Home");
+            assert_eq!(key_name(0x2D), "Insert");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +829,7 @@ mod tests {
             ctrl: true,
             alt: false,
             shift: false,
+            down: true,
         };
         assert_eq!(translate(&event, "mac").unwrap().key, "Cmd+C");
     }
@@ -593,6 +905,7 @@ mod tests {
                 ctrl: true,
                 alt: false,
                 shift: false,
+                down: true,
             },
             CapturedEvent::MouseMove { x: -3, y: 7 },
         ] {
@@ -601,5 +914,130 @@ mod tests {
         }
         let bad = bincode::serialize(&"Not a hotkey").unwrap();
         assert!(bincode::deserialize::<CapturedEvent>(&bad).is_err());
+    }
+
+    #[test]
+    fn key_release_survives_wire_round_trip() {
+        // Regression: only keydown was forwarded, so a peer could leave keys
+        // logically held after focus changes or a disconnect.
+        let event = CapturedEvent::Key {
+            key: "Shift".into(),
+            ctrl: false,
+            alt: false,
+            shift: true,
+            down: false,
+        };
+        let bytes = bincode::serialize(&event).unwrap();
+        assert_eq!(bincode::deserialize::<CapturedEvent>(&bytes).unwrap(), event);
+    }
+
+    #[test]
+    fn mouse_button_and_wheel_survive_wire_round_trip() {
+        // Regression: the event model had no mouse buttons or wheel, so clicks
+        // and scrolling could never cross a machine boundary.
+        for event in [
+            CapturedEvent::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                x: 12,
+                y: 34,
+            },
+            CapturedEvent::MouseWheel {
+                delta: -120,
+                x: 56,
+                y: 78,
+            },
+        ] {
+            let bytes = bincode::serialize(&event).unwrap();
+            assert_eq!(bincode::deserialize::<CapturedEvent>(&bytes).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn special_keys_map_to_windows_virtual_keys() {
+        // Regression: injection took only the first ASCII letter, so Enter,
+        // arrows, Backspace and function keys became VK 0 on the target.
+        assert_eq!(virtual_key("Enter"), 13);
+        assert_eq!(virtual_key("Escape"), 27);
+        assert_eq!(virtual_key("Space"), 32);
+        assert_eq!(virtual_key("Left"), 37);
+        assert_eq!(virtual_key("F5"), 0x74);
+        assert_eq!(virtual_key("A"), 65);
+    }
+
+    #[test]
+    fn raw_virtual_key_names_map_to_numeric_codes() {
+        // Regression: key_name emits VK(n) for keys with no printable name,
+        // but virtual_key read only the first character and injected 'V'.
+        assert_eq!(virtual_key("VK(112)"), 112);
+        assert_eq!(virtual_key("VK(16)"), 16);
+        assert_eq!(virtual_key("VK(186)"), 186);
+        assert_eq!(virtual_key("VK(999)"), 0);
+        assert_eq!(virtual_key("VK(not-a-number)"), 0);
+    }
+
+    #[test]
+    fn mouse_button_flags_distinguish_press_and_release() {
+        // Regression: without per-button flags, injected clicks could never
+        // distinguish down from up and would leave the target button held.
+        assert_ne!(
+            mouse_button_flags(MouseButton::Left, true),
+            mouse_button_flags(MouseButton::Left, false)
+        );
+        assert_ne!(
+            mouse_button_flags(MouseButton::Right, true),
+            mouse_button_flags(MouseButton::Middle, true)
+        );
+    }
+
+    #[test]
+    fn pause_then_resume_restores_local_capture_without_restarting_hooks() {
+        // Regression: RPC emergency stop unhooked the OS hooks, but resume only
+        // set forwarding=true, so local input stayed dead until app restart.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_sender("pc-b", tx);
+        bridge.forwarding = true;
+
+        bridge.pause();
+        assert!(!bridge.forwarding);
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 1, y: 2 }));
+        assert!(rx.try_recv().is_err());
+
+        bridge.resume();
+        assert!(bridge.forwarding);
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 3, y: 4 }));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn captured_events_are_stamped_with_the_currently_connected_peer() {
+        // Regression: production stamped the local device ID as the target, so
+        // once IDs were unique the receiver would reject every input frame.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_peer = Arc::new(Mutex::new(Some("pc-b".to_string())));
+        let peer_for_bridge = active_peer.clone();
+        let mut bridge = InputBridge::with_target_provider(
+            tx,
+            Arc::new(|| true),
+            Arc::new(move || peer_for_bridge.lock().unwrap().clone()),
+        );
+        bridge.forwarding = true;
+
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 1, y: 2 }));
+        match rx.try_recv().unwrap() {
+            Message::InputEvent { target, .. } => assert_eq!(target, "pc-b"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        *active_peer.lock().unwrap() = Some("pc-c".to_string());
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 3, y: 4 }));
+        match rx.try_recv().unwrap() {
+            Message::InputEvent { target, .. } => assert_eq!(target, "pc-c"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        *active_peer.lock().unwrap() = None;
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 5, y: 6 }));
+        assert!(rx.try_recv().is_err());
     }
 }
