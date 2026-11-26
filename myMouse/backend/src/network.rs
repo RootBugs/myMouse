@@ -23,6 +23,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const MAX_INPUT_EVENTS_PER_SECOND: usize = 250;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const INPUT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// True only when `now` is later than `last` by strictly more than `timeout`.
+/// Reversed clocks never make a connection look stale.
+pub fn liveness_expires(last: Instant, now: Instant, timeout: Duration) -> bool {
+    match now.checked_duration_since(last) {
+        Some(elapsed) => elapsed > timeout,
+        None => false,
+    }
+}
 
 /// Capability flags are enforced for every inbound message class, not just
 /// during the Hello handshake. Control messages remain allowed so a peer can
@@ -332,6 +343,8 @@ struct PeerRuntime {
     active_peer_id: Arc<Mutex<Option<String>>>,
     last_input_window: Instant,
     input_events_in_window: usize,
+    last_peer_frame: Instant,
+    watchdog_notified: bool,
 }
 
 impl PeerRuntime {
@@ -372,6 +385,8 @@ impl PeerRuntime {
                 active_peer_id,
                 last_input_window: Instant::now(),
                 input_events_in_window: 0,
+                last_peer_frame: Instant::now(),
+                watchdog_notified: false,
             };
             runtime.run().await;
         });
@@ -379,8 +394,13 @@ impl PeerRuntime {
     }
 
     async fn run(&mut self) {
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    self.send_heartbeat();
+                    self.check_liveness(Instant::now());
+                }
                 command = self.commands.recv() => {
                     match command {
                         Some(RuntimeCommand::Shutdown) | None => break,
@@ -395,6 +415,48 @@ impl PeerRuntime {
             }
         }
         self.connections.clear();
+    }
+
+    /// Send one v2 `Status` heartbeat to the single active peer, if any.
+    fn send_heartbeat(&self) {
+        let target = {
+            let active = self.active_peer_id.lock().unwrap();
+            active.clone()
+        };
+        let Some(key) = select_send_key(&self.connections, target.as_deref()) else {
+            return;
+        };
+        if let Some(connection) = self.connections.get(&key) {
+            let _ = connection.tx.send(OutgoingFrame {
+                message: Message::Status {
+                    connected: true,
+                    devices: vec![self.local_device_id.clone()],
+                },
+                ack: None,
+            });
+        }
+    }
+
+    /// Detect a silent peer and release injected input at most once per silent
+    /// episode. Never re-enables injection: `input_gate` is deliberately not
+    /// read or written here.
+    fn check_liveness(&mut self, now: Instant) -> bool {
+        if !liveness_expires(self.last_peer_frame, now, INPUT_WATCHDOG_TIMEOUT) {
+            self.watchdog_notified = false;
+            return false;
+        }
+        if self.watchdog_notified {
+            return false;
+        }
+        let held_input = InputBridge::release_all_injected();
+        if held_input {
+            emit(json!({
+                "notification": "inputLost",
+                "reason": "peer heartbeat timeout",
+            }));
+        }
+        self.watchdog_notified = true;
+        true
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
@@ -600,6 +662,10 @@ impl PeerRuntime {
         {
             return;
         }
+        // Any live peer frame is proof of life, including capability-rejected
+        // frames and Status heartbeats. Stale frames from a replaced connection
+        // are already dropped above and must not keep the watchdog asleep.
+        self.last_peer_frame = Instant::now();
         let capabilities = {
             let state = self.state.lock().unwrap();
             state
@@ -849,6 +915,9 @@ impl PeerRuntime {
                     "payloadBytes": payload_bytes,
                 }));
             }
+            // Heartbeats carry no user-visible state; their arrival already
+            // refreshed `last_peer_frame` above.
+            Message::Status { .. } => {}
             other => {
                 emit(json!({
                     "notification": "message",
@@ -1028,8 +1097,47 @@ mod tests {
             active_peer_id: active_peer_id.clone(),
             last_input_window: Instant::now(),
             input_events_in_window: 0,
+            last_peer_frame: Instant::now(),
+            watchdog_notified: false,
         };
         (runtime, peer_connected, active_peer_id)
+    }
+
+    #[test]
+    fn liveness_expires_after_timeout() {
+        let last = Instant::now();
+        let timeout = Duration::from_secs(3);
+
+        assert!(!liveness_expires(
+            last,
+            last + Duration::from_millis(2_999),
+            timeout
+        ));
+        assert!(liveness_expires(
+            last,
+            last + Duration::from_millis(3_001),
+            timeout
+        ));
+        assert!(!liveness_expires(last + Duration::from_secs(1), last, timeout));
+    }
+
+    #[test]
+    fn watchdog_fires_once_until_a_peer_frame_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let now = Instant::now();
+
+        runtime.last_peer_frame = now - Duration::from_secs(4);
+        runtime.watchdog_notified = false;
+        assert!(runtime.check_liveness(now));
+        assert!(!runtime.check_liveness(now));
+
+        runtime.last_peer_frame = now;
+        assert!(!runtime.check_liveness(now));
+        assert!(!runtime.watchdog_notified);
     }
 
     #[test]

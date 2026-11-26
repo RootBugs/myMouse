@@ -2,6 +2,7 @@ use crate::layout::{escape_hotkey, Layout};
 use mymouse_protocol::Message;
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -11,13 +12,60 @@ use tokio::task::JoinHandle;
 /// `Hotkey` keeps a `&'static str` in the public API; deserialization maps the
 /// known wire strings back to static values so no untrusted string is leaked
 /// into a long-lived allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Right,
     Middle,
     X1,
     X2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InjectedRelease {
+    Key(u16),
+    Button(MouseButton),
+}
+
+/// Pure state for input injected on this machine. The Windows injection path
+/// records held keys/buttons here so a silent peer can be cleaned up without
+/// waiting for matching key-up frames.
+#[derive(Debug, Default)]
+pub struct InjectedInputTracker {
+    keys: HashSet<u16>,
+    buttons: HashSet<MouseButton>,
+}
+
+impl InjectedInputTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn note_key_down(&mut self, vk: u16) {
+        self.keys.insert(vk);
+    }
+
+    pub fn note_key_up(&mut self, vk: u16) {
+        self.keys.remove(&vk);
+    }
+
+    pub fn note_button_down(&mut self, button: MouseButton) {
+        self.buttons.insert(button);
+    }
+
+    pub fn note_button_up(&mut self, button: MouseButton) {
+        self.buttons.remove(&button);
+    }
+
+    pub fn clear(&mut self) -> Vec<InjectedRelease> {
+        let keys = self.keys.drain().map(InjectedRelease::Key);
+        let buttons = self.buttons.drain().map(InjectedRelease::Button);
+        keys.chain(buttons).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.buttons.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -509,6 +557,20 @@ impl InputBridge {
         win::release_modifiers();
     }
 
+    /// Release every key or button currently held down by remote injection.
+    /// Returns whether any held input was actually released. Non-Windows
+    /// builds never inject input, so they report nothing held.
+    pub fn release_all_injected() -> bool {
+        #[cfg(windows)]
+        {
+            win::release_all_injected()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// Install OS hooks (Windows only). The returned task owns the hook
     /// message loop and ends when the hooks are stopped.
     pub fn start(bridge: Arc<Mutex<InputBridge>>) -> JoinHandle<()> {
@@ -569,6 +631,13 @@ mod win {
     /// Modifier state already injected on the target machine. Only transitions
     /// are sent so held modifiers survive across separate key events.
     static TARGET_MODIFIERS: AtomicU8 = AtomicU8::new(0);
+    /// Keys and buttons currently held down by our `SendInput` calls. The
+    /// watchdog drains this when a peer stops sending heartbeats.
+    static INJECTED: OnceLock<Mutex<InjectedInputTracker>> = OnceLock::new();
+
+    fn injected() -> &'static Mutex<InjectedInputTracker> {
+        INJECTED.get_or_init(|| Mutex::new(InjectedInputTracker::new()))
+    }
 
     struct HookGuard(Vec<isize>);
 
@@ -838,6 +907,14 @@ mod win {
                     let was = current & bit != 0;
                     let now = desired & bit != 0;
                     if was != now {
+                        {
+                            let mut tracker = injected().lock().unwrap();
+                            if now {
+                                tracker.note_key_down(vk as u16);
+                            } else {
+                                tracker.note_key_up(vk as u16);
+                            }
+                        }
                         inputs.push(key_input(vk as u16, now));
                     }
                 }
@@ -845,6 +922,14 @@ mod win {
                 // them again would release them immediately.
                 let vk = super::virtual_key(key);
                 if vk != 0 && !matches!(key.as_str(), "Ctrl" | "Alt" | "Shift") {
+                    {
+                        let mut tracker = injected().lock().unwrap();
+                        if *down {
+                            tracker.note_key_down(vk);
+                        } else {
+                            tracker.note_key_up(vk);
+                        }
+                    }
                     inputs.push(key_input(vk, *down));
                 }
             }
@@ -853,6 +938,14 @@ mod win {
                 inputs.push(absolute_move(*x, *y));
             }
             CapturedEvent::MouseButton { button, down, x, y } => {
+                {
+                    let mut tracker = injected().lock().unwrap();
+                    if *down {
+                        tracker.note_button_down(*button);
+                    } else {
+                        tracker.note_button_up(*button);
+                    }
+                }
                 inputs.push(absolute_move(*x, *y));
                 let mut input = INPUT::default();
                 input.r#type = INPUT_MOUSE;
@@ -894,8 +987,12 @@ mod win {
     }
 
     /// Release modifier keys without synthesising any character. Used when
-    /// the local escape hotkey stops forwarding.
+    /// the local escape hotkey stops forwarding. Also drains the injected-input
+    /// tracker so other held keys/buttons cannot stay stuck on the target.
     pub(super) fn release_modifiers() {
+        let _ = release_all_injected();
+        // Unconditionally lift modifiers as well: tracks older code paths that
+        // may have sent a modifier down before state tracking existed.
         let mut inputs = Vec::with_capacity(3);
         for modifier in [VK_CONTROL, VK_MENU, VK_SHIFT] {
             let mut input = INPUT::default();
@@ -912,6 +1009,52 @@ mod win {
         unsafe {
             let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         }
+    }
+
+    /// Release every key/button this process injected and report whether any
+    /// held input was found. Used by the peer-liveness watchdog.
+    pub(super) fn release_all_injected() -> bool {
+        let releases = {
+            let mut tracker = injected().lock().unwrap();
+            if tracker.is_empty() {
+                Vec::new()
+            } else {
+                tracker.clear()
+            }
+        };
+        if releases.is_empty() {
+            return false;
+        }
+        TARGET_MODIFIERS.store(0, Ordering::SeqCst);
+
+        let mut inputs = Vec::with_capacity(releases.len());
+        for release in releases {
+            match release {
+                InjectedRelease::Key(vk) => inputs.push(key_input(vk, false)),
+                InjectedRelease::Button(button) => {
+                    let data = match button {
+                        MouseButton::X1 => 1,
+                        MouseButton::X2 => 2,
+                        _ => 0,
+                    };
+                    let mut input = INPUT::default();
+                    input.r#type = INPUT_MOUSE;
+                    input.Anonymous.mi = MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: data,
+                        dwFlags: MOUSE_EVENT_FLAGS(super::mouse_button_flags(button, false)),
+                        time: 0,
+                        dwExtraInfo: 0,
+                    };
+                    inputs.push(input);
+                }
+            }
+        }
+        unsafe {
+            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+        true
     }
 
     pub(super) fn stop_hooks() {
@@ -971,6 +1114,30 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tracked_keys_and_buttons_are_released_once() {
+        let mut tracker = InjectedInputTracker::new();
+        tracker.note_key_down(65);
+        tracker.note_button_down(MouseButton::Left);
+        tracker.note_key_down(65);
+
+        assert!(!tracker.is_empty());
+        let releases = tracker.clear();
+        assert_eq!(releases.len(), 2);
+        assert!(releases.contains(&InjectedRelease::Key(65)));
+        assert!(releases.contains(&InjectedRelease::Button(MouseButton::Left)));
+        assert!(tracker.is_empty());
+        assert!(tracker.clear().is_empty());
+    }
+
+    #[test]
+    fn key_up_removes_tracked_key() {
+        let mut tracker = InjectedInputTracker::new();
+        tracker.note_key_down(16);
+        tracker.note_key_up(16);
+        assert!(tracker.is_empty());
     }
 
     #[test]

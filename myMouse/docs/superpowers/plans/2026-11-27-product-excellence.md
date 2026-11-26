@@ -100,7 +100,7 @@ Task 1 also fixed a discovered production bug: file transfers above one 256 KiB 
   - `PeerRuntime::check_liveness(&mut self, now: Instant) -> bool`
   - `PeerRuntime::last_peer_frame` / `watchdog_notified` fields
 
-- [ ] **Step 1: Write failing tracker and timeout tests**
+- [x] **Step 1: Write failing tracker and timeout tests**
 
 In `backend/src/input.rs` tests add:
   - `tracked_keys_and_buttons_are_released_once`: insert key down 65, button `Left` down, duplicate key down 65, then `clear()` returns exactly one key release for 65 and one button release for `Left`, tracker is empty, second `clear()` is empty.
@@ -109,43 +109,42 @@ In `backend/src/network.rs` tests add:
   - `liveness_expires_after_timeout`: timeout 3 s, `now = last + 2_999 ms` is false, `now = last + 3_001 ms` is true.
   - `watchdog_fires_once_until_a_peer_frame_arrives`: construct `test_runtime`, set `last_peer_frame` to `now - 4 s`, assert `check_liveness(now)` is true, assert a second call is false, set `last_peer_frame = now`, assert `check_liveness(now)` is false and `watchdog_notified` is false.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --manifest-path backend/Cargo.toml tracked_keys_and_buttons_are_released_once` then the other three named tests.
 Expected: compile errors for missing types/functions.
 
-- [ ] **Step 3: Implement the tracker and timeout helper**
+- [x] **Step 3: Implement the tracker and timeout helper**
 
 In `backend/src/input.rs`:
   - derive `Hash` on `MouseButton`;
   - add `InjectedRelease` enum with `Key(u16)` and `Button(MouseButton)` variants;
   - add `InjectedInputTracker` backed by `HashSet<u16>` and `HashSet<MouseButton>`; `clear()` drains both sets into `Vec<InjectedRelease>`;
-  - add `pub fn release_all_injected(&self) -> bool` that calls the Windows release function when compiled for Windows and returns whether anything was held. On non-Windows return false.
-  - add top-level `pub fn liveness_expires(last: Instant, now: Instant, timeout: Duration) -> bool` in `network.rs` using `now.duration_since(last)` with a safe false on reversed time.
+  - add `pub fn release_all_injected() -> bool` that calls the Windows release function when compiled for Windows and returns whether anything was held. On non-Windows return false. The static form is required because injection is an associated function; see the ledger ruling.
+  - add top-level `pub fn liveness_expires(last: Instant, now: Instant, timeout: Duration) -> bool` in `network.rs` using `now.checked_duration_since(last)` with a safe false on reversed time.
   - Windows injection path: track modifier VK transitions and every non-modifier key down/up; track mouse button down/up; `release_*` functions clear the tracker and send real key-up/button-up `SendInput` calls. Keep existing loop filtering intact.
 
-- [ ] **Step 4: Run the focused tests to verify they pass**
+- [x] **Step 4: Run the focused tests to verify they pass**
 
 Run: `cargo test --manifest-path backend/Cargo.toml tracked_keys_and_buttons_are_released_once`, then the other three.
 Expected: four named tests pass.
 
-- [ ] **Step 5: Wire heartbeats and the watchdog into the runtime**
+- [x] **Step 5: Wire heartbeats and the watchdog into the runtime**
 
 In `backend/src/network.rs`:
   - add constants `HEARTBEAT_INTERVAL = Duration::from_secs(1)` and `INPUT_WATCHDOG_TIMEOUT = Duration::from_secs(3)`;
   - add `last_peer_frame: Instant` and `watchdog_notified: bool` to `PeerRuntime` and both constructors/tests;
-  - in `run()`, add a `tokio::time::interval(HEARTBEAT_INTERVAL)` branch calling `send_heartbeat()`;
-  - `send_heartbeat()` sends `Message::Status { connected: true, devices: vec![self.local_device_id.clone()] }` through `select_send_key(&self.connections, self.active_peer_id mirror)` without an ack;
-  - update `last_peer_frame` on every inbound frame in `dispatch()` and add a no-op `Message::Status { .. }` branch so heartbeats do not spam generic debug notifications;
-  - `check_liveness(now)` must: if `liveness_expires` and `InputBridge::release_all_injected()` reports held input and `!watchdog_notified`, emit `{"notification":"inputLost","reason":"peer heartbeat timeout"}` and set `watchdog_notified = true`; if fresh, reset `watchdog_notified = false`; return whether the timeout condition held.
-  - Never touch `input_gate` in the watchdog.
+  - in `run()`, add a `tokio::time::interval(HEARTBEAT_INTERVAL)` branch calling `send_heartbeat()` and `check_liveness()`;
+  - `send_heartbeat()` sends `Message::Status { connected: true, devices: vec![self.local_device_id.clone()] }` through `select_send_key(&self.connections, active_peer_id mirror)` without an ack;
+  - update `last_peer_frame` on live inbound frames after stale generation frames are rejected, and add a no-op `Message::Status { .. }` branch so heartbeats do not spam generic debug notifications;
+  - `check_liveness(now)` latches once per silent episode, emits `{"notification":"inputLost","reason":"peer heartbeat timeout"}` when held input was released, resets the latch on a fresh frame, and never touches `input_gate`. See the ledger ruling for the latch behavior.
 
-- [ ] **Step 6: Run focused and full backend tests**
+- [x] **Step 6: Run focused and full backend tests**
 
 Run: `cargo test --manifest-path backend/Cargo.toml`.
 Expected: all tests pass, including the two integration binaries.
 
-- [ ] **Step 7: Verify repo hygiene and commit**
+- [x] **Step 7: Verify repo hygiene and commit**
 
 Run: `git diff --check`, `npm test -- --run`, `npm run build`, `npm run smoke`.
 Expected: all exit 0.
