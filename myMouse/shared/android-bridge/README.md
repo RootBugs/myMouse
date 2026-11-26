@@ -15,7 +15,7 @@ FFI-shaped primitives shared with the Android app. The crate reuses
 | Trust model | Implemented + host-tested | Capabilities, records, JSON store load/save. |
 | Discovery model | Implemented + host-tested | Shared peer model and service-name parsing; Android NSD runtime lives in platform code, not here. |
 | Pinned TLS socket runtime | **Source-only in Kotlin**, not in this crate | Rust crate has config/fingerprint helpers only; the live TLS socket is `PinnedTlsBridge.kt` (`javax.net.ssl`) in `apps/android`. |
-| UniFFI bindings | **Not generated** | No UDL, no generated Kotlin classes, no `.so` packaged. `BridgeProvider` will use a generated class only if one is actually added; nothing is fabricated. |
+| UniFFI bindings | **Scaffolded** | `uniffi/mymouse_bridge.udl` and `uniffi/README.md` describe the intended export surface; no generated Kotlin classes or `.so` were produced in this environment. `BridgeProvider` must only use a generated class when one is actually present. |
 | APK / device verification | **Not done** | No Android SDK/NDK/Gradle on this host. |
 
 ## Host verification (actually run here)
@@ -46,10 +46,10 @@ Windows host, or accessibility injection.
 With NDK installed:
 
 ```powershell
-cargo install cargo-ndk
+cargo install cargo-ndk uniffi-bindgen-cli@0.28
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 cargo ndk -t arm64-v8a -o ../apps/android/app/src/main/jniLibs build --release --manifest-path Cargo.toml
-# Add uniffi/mymouse_bridge.udl, then generate Kotlin bindings with uniffi-bindgen.
+# Generate Kotlin bindings from uniffi/mymouse_bridge.udl (scaffold) with uniffi-bindgen.
 ```
 
 Generated bindings must implement `MyMouseBridge` and be placed under

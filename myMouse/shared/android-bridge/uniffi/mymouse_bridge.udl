@@ -1,0 +1,73 @@
+// myMouse Android bridge UDL scaffold.
+// This file describes the intended UniFFI surface for Kotlin bindings.
+// It is a scaffold artifact: binding generation was not run in this environment
+// because Android NDK/cargo-ndk/uniffi-bindgen were not installed.
+//
+// Keep in sync with src/*.rs exports and mymouse-protocol wire format.
+
+namespace mymouse_android_bridge {
+    string bridge_version();
+    u16 protocol_version();
+    string generate_pairing_code();
+    string pairing_uri(string code, string peer_id);
+    ParsedPairingUri? parse_pairing_uri(string uri);
+    sequence<u8> encode_frame(BridgeMessage message);
+    BridgeMessage decode_frame_payload(sequence<u8> payload);
+    string? normalize_fingerprint(string input);
+    string certificate_fingerprint(sequence<u8> cert_der);
+};
+
+dictionary ParsedPairingUri {
+    string code;
+    string peer_id;
+};
+
+dictionary Capabilities {
+    boolean input;
+    boolean clipboard;
+    boolean files;
+    boolean screen;
+};
+
+dictionary TrustedDeviceRecord {
+    string device_id;
+    string name;
+    Capabilities capabilities;
+    string? fingerprint;
+    u64 paired_at_unix_ms;
+};
+
+dictionary DiscoveredPeer {
+    string id;
+    string name;
+    string address;
+    u16 port;
+    string? fingerprint_hint;
+};
+
+dictionary TransportConfig {
+    string host;
+    u16 port;
+    sequence<string> pinned_fingerprints;
+    string device_id;
+    string device_name;
+};
+
+[Enum]
+interface BridgeProtocolError {
+    TooShort();
+    VersionMismatch();
+    TooLarge();
+    InvalidPayload();
+};
+
+[Enum]
+interface BridgeMessage {
+    Hello(u16 version, string device_id, string name);
+    PairCode(string code);
+    PairApprove();
+    PairReject();
+    InputEvent(string target, sequence<u8> payload);
+    Status(boolean connected, sequence<string> devices);
+    Error(string message);
+};
