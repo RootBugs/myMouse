@@ -177,6 +177,57 @@ mod tests {
     }
 
     #[test]
+    fn allows_peer_requires_an_explicit_usable_capability() {
+        let mut store = TrustStore::default();
+        assert!(!store.allows_peer("unknown"));
+
+        store.grant(
+            "screen-only",
+            Capabilities {
+                input: false,
+                clipboard: false,
+                files: false,
+                screen: true,
+            },
+        );
+        assert!(store.is_trusted("screen-only"));
+        assert!(!store.allows_peer("screen-only"));
+
+        for (id, capabilities) in [
+            (
+                "input-only",
+                Capabilities {
+                    input: true,
+                    clipboard: false,
+                    files: false,
+                    screen: false,
+                },
+            ),
+            (
+                "clipboard-only",
+                Capabilities {
+                    input: false,
+                    clipboard: true,
+                    files: false,
+                    screen: false,
+                },
+            ),
+            (
+                "files-only",
+                Capabilities {
+                    input: false,
+                    clipboard: false,
+                    files: true,
+                    screen: false,
+                },
+            ),
+        ] {
+            store.grant(id, capabilities);
+            assert!(store.allows_peer(id), "{id} should be allowed");
+        }
+    }
+
+    #[test]
     fn trust_ids_are_exact_and_revocation_removes_the_pin() {
         let mut store = TrustStore::default();
         store.grant("pc-b", Capabilities::default());

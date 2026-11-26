@@ -874,11 +874,17 @@ async fn main() {
         return;
     }
     if args.iter().any(|a| a == "--ipc" || a == "stdio") {
-        run_ipc().await;
+        if let Err(error) = run_ipc().await {
+            eprintln!("mymouse IPC failed: {error}");
+            std::process::exit(1);
+        }
         return;
     }
     // Default: run IPC loop (Electron spawns with --ipc stdio; also safe default).
-    run_ipc().await;
+    if let Err(error) = run_ipc().await {
+        eprintln!("mymouse IPC failed: {error}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -952,5 +958,98 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Production-style end-to-end gate check with real generated identities:
+    /// a pinned client whose Hello names a trusted device is admitted, while
+    /// an unknown device ID or clipboard data before Hello is rejected.
+    #[tokio::test]
+    async fn production_gate_accepts_only_pinned_trusted_hello() {
+        use crate::transport::Client;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let server_identity = Identity::load_or_create(server_dir.path()).unwrap();
+        let client_identity = Identity::load_or_create(client_dir.path()).unwrap();
+        let client_fp = client_identity.fingerprint().to_string();
+        let server_fp = server_identity.fingerprint().to_string();
+
+        let pins: ClientPinMap = Arc::new(RwLock::new(HashMap::from([(
+            client_fp.clone(),
+            "pc-b".to_string(),
+        )])));
+        let server = Server::bind_pinned(
+            "127.0.0.1:0",
+            server_identity.cert_der.clone(),
+            server_identity.key_der.clone(),
+            pins,
+        )
+        .await
+        .unwrap();
+
+        let mut app = AppState::with_device_id(state_dir.path().to_path_buf(), "local-pc".into());
+        app.trust.grant("pc-b", Capabilities::default());
+        app.trust.set_fingerprint("pc-b", client_fp.clone());
+        let state = Arc::new(Mutex::new(app));
+
+        let mut trusted = Client::connect_with_identity(
+            server.local_addr(),
+            &[server_fp.clone()],
+            Some((
+                client_identity.cert_der.clone(),
+                client_identity.key_der.clone(),
+            )),
+        )
+        .await
+        .unwrap();
+        trusted.send(&hello(PROTOCOL_VERSION, "pc-b")).await.unwrap();
+        let mut accepted = server.accept().await.unwrap();
+        assert_eq!(
+            gate_inbound_stream(&state, &mut accepted).await,
+            Ok("pc-b".to_string())
+        );
+
+        let mut untrusted = Client::connect_with_identity(
+            server.local_addr(),
+            &[server_fp.clone()],
+            Some((
+                client_identity.cert_der.clone(),
+                client_identity.key_der.clone(),
+            )),
+        )
+        .await
+        .unwrap();
+        untrusted
+            .send(&hello(PROTOCOL_VERSION, "stranger"))
+            .await
+            .unwrap();
+        let mut rejected = server.accept().await.unwrap();
+        assert!(gate_inbound_stream(&state, &mut rejected).await.is_err());
+
+        let mut early_data = Client::connect_with_identity(
+            server.local_addr(),
+            &[server_fp],
+            Some((
+                client_identity.cert_der.clone(),
+                client_identity.key_der.clone(),
+            )),
+        )
+        .await
+        .unwrap();
+        early_data
+            .send(&Message::ClipboardUpdate(mymouse_protocol::ClipboardPayload {
+                device_id: "pc-b".to_string(),
+                kind: mymouse_protocol::ClipboardKind::Text,
+                text: Some("early clipboard data".to_string()),
+                data_base64: None,
+                mime: None,
+                timestamp_ms: 1,
+                seq: 1,
+            }))
+            .await
+            .unwrap();
+        let mut rejected_data = server.accept().await.unwrap();
+        assert!(gate_inbound_stream(&state, &mut rejected_data).await.is_err());
     }
 }
