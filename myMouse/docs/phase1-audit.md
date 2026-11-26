@@ -81,6 +81,32 @@ The failing tests before the fix showed `left: 86 / right: 112` for `VK(112)`
 and `left: "VK(16)" / right: "Shift"`. After the minimal fix the backend suite
 returned `52 passed; 0 failed`.
 
+## Product excellence increment — measured baseline and input liveness
+
+Status: benchmark **implemented and harness-tested**; watchdog **implemented,
+unit-tested and wired**; both **not physically tested**.
+
+- `npm run benchmark` starts two real `mymouse-backend.exe` processes and writes
+  [benchmarks.md](benchmarks.md). It is a **two-process loopback harness** on
+  one Windows host: not field latency, not a physical two-PC session, and not a
+  comparison with any upstream product.
+- Measured values on this host: input delivery 11.72 ms, clipboard 15.383
+  Mbit/s, file 14.925 Mbit/s, cold pinned-TLS connect 116.5 ms, idle CPU 0% on
+  both processes, idle RAM 12.02/11.77 MiB. Reconnect after peer loss is
+  deliberately `null`/unmeasured because test mode has no auto-reconnect loop.
+- Benchmarking exposed a real production bug: file transfers above one 256 KiB
+  chunk stalled after the first chunk. The regression test
+  `accept_sends_every_chunk_for_large_file` went red → green, and the 1 MiB
+  benchmark now observes a genuinely completed transfer.
+- The liveness watchdog reuses v2 `Status` as a one-second heartbeat. After more
+  than three seconds without a live peer frame, tracked injected keys/buttons
+  are released once and `inputLost` is emitted when held input existed. The
+  tracker, timeout boundary and one-shot latch are unit-tested. The watchdog
+  never writes `input_gate`, so emergency stop remains authoritative.
+- Windows `SendInput` release effects and a physical silent-peer/held-key
+  interruption were **not** hardware-audited. No superiority or field-latency
+  claim follows from this increment.
+
 ## Security posture
 
 Status: **implemented and code/test-verified; no live downgrade or physical
@@ -105,11 +131,13 @@ Commands were run from `myMouse/` unless noted.
 
 | Command | Result |
 | --- | --- |
-| `cargo test` in `myMouse/backend` | `68 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
+| `cargo test` in `myMouse/backend` | `73 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
 | `cargo test` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
 | `npm test -- --run` | `5 files / 19 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
 | `npm run build` | exit 0; Vite produced `index.html`, CSS, and JS assets; Electron TypeScript build succeeded |
 | `npm run smoke` | `OK: pc-a forwarded one crossing to pc-b over pinned TLS; pc-b received one InputEvent.` |
+| `npm run benchmark` | exit 0; wrote two-process loopback values to `docs/benchmarks.md`, reconnect unmeasured |
+| `git diff --check` | exit 0; only pre-existing LF→CRLF normalization warnings |
 | Back-to-back `npm run smoke` | both runs exit 0 after making smoke log paths per-run unique |
 | `npm run dist` | exit 0; unsigned NSIS installer and `win-unpacked` output built |
 | `powershell -NoProfile -ExecutionPolicy Bypass -File installer\verify.ps1` | `OK: unsigned Windows desktop, release backend, and packaged backend resource are present.` |
@@ -135,6 +163,8 @@ to `git diff --check`, which is clean.
   gates, clipboard and file manager bounds, pairing state machine, rate
   limiting, and hotkey rejection.
 - Backend-driven React layout view with an explicit empty state.
+- Multi-chunk file-transfer regression test, injected-input tracker, liveness
+  timeout boundary, one-shot watchdog latch, and Status heartbeat dispatch.
 - Review-driven hardening (three review rounds): handoff frames are routed to
   the explicit crossing target instead of the runtime's independent selection;
   revoking the active peer disconnects it, clears the runtime mirrors and pauses
@@ -149,6 +179,8 @@ to `git diff --check`, which is clean.
 - Two real backend processes exchange a synthetic crossing over pinned TLS.
 - Clipboard text and exact file bytes travel through the same pinned-TLS v2
   transport (offer → accept → chunks → complete).
+- The two-process benchmark measures input, clipboard/file throughput, cold
+  connect and idle resources; it completes a 1 MiB multi-chunk transfer.
 - Frontend React tests and Electron bridge tests.
 - Windows packaging and artifact presence.
 
@@ -156,7 +188,9 @@ to `git diff --check`, which is clean.
 
 - None. No second physical PC/tablet was available. There was no real mDNS
   discovery session, real pairing between devices, real keyboard/mouse handoff,
-  multi-monitor/DPI validation, or Wi-Fi interruption test.
+  multi-monitor/DPI validation, or Wi-Fi interruption test. The benchmark is
+  two-process loopback only, and the liveness release path has no hardware-level
+  `SendInput` audit or physical silent-peer test.
 
 ### Not implemented / still open
 
@@ -169,12 +203,17 @@ to `git diff --check`, which is clean.
 - Replay protection (nonces/timestamps) and stronger per-peer rate limiting.
 - Real multi-peer routing/topology beyond one connected peer.
 - Remote screen streaming; Android APK and macOS builds; code signing.
-- Hardware-level audit of Windows `SendInput` and live TLS downgrade rejection.
+- Hardware-level audit of Windows `SendInput`, including watchdog key/button
+  release, and live TLS downgrade rejection.
+- Production reconnect-time measurement after peer loss; the loopback harness
+  reports it as unmeasured.
 - Return-to-local re-entry when the cursor crosses back from the peer (the
   emergency stop/Escape path is authoritative today).
 
 ## Next milestone
 
-Validate the implemented topology/handoff path with two physical machines and
-real multi-monitor geometry, then add return-to-local re-entry only after that
-behaviour is verified. Do not claim field readiness before physical testing.
+Validate the implemented topology/handoff path and the liveness release path
+with two physical machines, real multi-monitor geometry, and an actual silent
+peer while a key/button is held. Measure production reconnect time in that
+setting, then add return-to-local re-entry only after the handoff behaviour is
+verified. Do not claim field readiness before physical testing.

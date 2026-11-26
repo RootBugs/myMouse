@@ -163,11 +163,11 @@ Commit: `fix: release held input when a peer heartbeat stops`.
 - Consumes: measured report from Task 1 and watchdog behaviour from Task 2.
 - Produces: updated status inventory and verification evidence.
 
-- [ ] **Step 1: Update the three docs**
+- [x] **Step 1: Update the three docs**
 
-State that the benchmark is two-process loopback harness data, not field or comparative data. State that held-input release is unit-tested and wired, with no hardware-level `SendInput` audit. Keep the autostart and unsigned-build statements intact.
+State that the benchmark is two-process loopback harness data, not field or comparative data. State that held-input release is unit-tested and wired, with no hardware-level `SendInput` audit. Keep the autostart and unsigned-build statements intact. Also refresh `docs/product-roadmap.md` because it is the public status index; see the ledger ruling.
 
-- [ ] **Step 2: Verify and commit**
+- [x] **Step 2: Verify and commit**
 
 Run: `git diff --check`.
 Expected: exit 0.

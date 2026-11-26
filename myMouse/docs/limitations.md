@@ -30,6 +30,14 @@ Last accuracy pass: 2026-11-27. Scope statements below distinguish what was
   until Escape/local stop. This is unit-tested and wired to the Windows hook
   path, but no live cursor crossing was exercised on two physical machines; the
   two-instance harness still uses a synthetic crossing over pinned TLS.
+- **Peer liveness is implemented and unit-tested, not physically tested.** The
+  runtime sends a v2 `Status` heartbeat once per second on the active
+  connection. More than three seconds without a live peer frame releases tracked
+  injected keys/buttons once and emits `inputLost`; fresh frames reset the
+  latch. The watchdog does not write `input_gate`, so emergency stop remains
+  authoritative. The tracker/timeout state transitions are unit-tested, but the
+  actual Windows `SendInput` key-up/button-up effects and a real Wi-Fi/peer
+  interruption were not hardware-verified.
 
 ## Clipboard and file transfer
 
@@ -50,6 +58,20 @@ Last accuracy pass: 2026-11-27. Scope statements below distinguish what was
   size and sequence checks, and completion verifies actual file size and SHA-256.
 - Remote/live screen streaming is still unimplemented; the screen-related UI
   is a placeholder.
+- Multi-chunk file transfers were fixed after the benchmark exposed a stall
+  above 256 KiB. The regression is unit-tested, and the completed 1 MiB transfer
+  is harness-tested; no physical two-PC file transfer was run.
+
+## Performance measurement
+
+- `npm run benchmark` writes [benchmarks.md](benchmarks.md) from two real
+  `mymouse-backend.exe` processes on this one Windows host. It is a
+  **two-process loopback harness**, not field latency, not a physical two-PC
+  session, and not a comparison with any upstream product.
+- Reconnect time is reported as unmeasured. Test mode opens one pinned
+  outbound connection and does not auto-reconnect after peer loss; a harness
+  number would not describe production recovery.
+- No superiority or production-latency claim is made from these values.
 
 ## Platform scope
 

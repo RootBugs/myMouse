@@ -15,6 +15,15 @@ physical* PCs were available here, so all two-machine behaviour remains
 harness-verified rather than field-verified. See the
 [Phase 1 audit](docs/phase1-audit.md).
 
+A reproducible two-process loopback benchmark is available with
+`npm run benchmark`; its report is [docs/benchmarks.md](docs/benchmarks.md).
+Those numbers are harness values on one host — not field latency, not a
+physical two-PC session, and not a comparison with any upstream product.
+The peer-liveness watchdog is implemented and unit-tested: it sends one v2
+`Status` heartbeat per second, releases held injected input after more than
+three seconds without a live peer frame, and emits `inputLost`. Hardware-level
+`SendInput` release and a real silent-peer interruption remain untested.
+
 Android (`apps/android/`) and the Rust FFI crate (`shared/android-bridge/`) are
 **Phase 3 scaffolds / source-complete but source-only**: no Android SDK/NDK/Gradle
 is installed on this Windows host, so no APK was built and no emulator/device
@@ -43,7 +52,13 @@ is provided.
   from the wire.
 - Two-instance end-to-end tests that link two backend processes over pinned TLS
   and verify a cursor crossing, exact clipboard text delivery, and exact file
-  bytes (offer → accept → chunks → complete).
+  bytes (offer → accept → chunks → complete). A larger-file regression test
+  covers multi-chunk transfers above 256 KiB.
+- A reproducible benchmark harness (`npm run benchmark`) that records input
+  delivery, clipboard/file throughput, cold connect, and idle CPU/RAM from two
+  backend processes. Reconnect time is reported as unmeasured.
+- A peer-liveness watchdog that reuses v2 `Status` heartbeats and releases held
+  injected keys/buttons after a silent peer, without re-enabling injection.
 - Pinned outbound connection RPC (`connectPeer`) that requires a verified
   64-hex SHA-256 fingerprint and rejects a mismatch with stored trust.
 - Discovery-backed pairing RPCs: `discoveredPeers` lists nearby peers (id, name,
@@ -78,6 +93,7 @@ npm install
 npm run build          # typecheck + Vite + Electron sources
 npm run test -- --run  # frontend tests
 npm run smoke          # two-instance pinned-TLS delivery smoke test
+npm run benchmark      # measured two-process loopback report
 npm run dist           # unsigned Windows build (see below)
 ```
 
@@ -169,6 +185,13 @@ it, it will require your explicit action.
   unit-tested but has not been validated on two physical machines.
 - Only one input source is active at a time. Injected events are filtered from
   capture so control cannot loop back.
+- **Peer liveness:** the runtime sends one v2 `Status` heartbeat per second on
+  the active connection. More than three seconds without a live peer frame
+  releases any injected keys or buttons once and emits `inputLost`. A fresh
+  peer frame clears the latch. The watchdog never writes the injection gate;
+  Escape/local stop and emergency pause remain authoritative. Tracker and
+  timeout behaviour is unit-tested; actual `SendInput` release is not
+  hardware-audited.
 - **Emergency stop:** Dashboard → **Emergency stop** pauses capture without
   unhooking OS hooks and releases held modifiers, returning control to the local
   host. **Resume input** resumes capture cleanly. Remote hotkey events are
@@ -201,7 +224,12 @@ See [docs/limitations.md](docs/limitations.md). In short:
   codes, file size/count limits) are covered by unit/integration tests. TLS 1.3
   is configured at the rustls builder level; no live TLS 1.2 downgrade attempt
   was executed here. OS-level `SendInput` behaviour is covered by code paths and
-  test-mode notifications, not by a hardware-level audit.
+  test-mode notifications, not by a hardware-level audit. The liveness watchdog
+  is unit-tested and wired, but a physical peer loss with a held key/button was
+  not exercised.
+- Performance values in [docs/benchmarks.md](docs/benchmarks.md) are two-process
+  loopback data from one Windows host. They are not field latency, not a
+  comparison with another KVM, and reconnect time is explicitly unmeasured.
 - Windows capture/injection now maps key down/up, mouse buttons (including
   X1/X2), wheel events, canonical modifier/navigation/function keys, and exact
   `VK(n)` values. Complex layouts, IMEs, dead keys, and per-monitor DPI
