@@ -86,7 +86,7 @@ class PairingActivity : AppCompatActivity() {
         binding.pairingResult.text = "Connecting to $address:$port with certificate pinning..."
         val localId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
             ?.takeIf { it.isNotBlank() } ?: "android-device"
-        val localName = Build.MODEL ?: "Android"
+        val localName = Build.MODEL.takeIf { it.isNotBlank() } ?: "Android"
         val prefs = getSharedPreferences("mymouse_settings", MODE_PRIVATE)
         val caps = Capabilities(
             input = prefs.getBoolean("cap_input", true),

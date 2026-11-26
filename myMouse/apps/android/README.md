@@ -2,9 +2,10 @@
 
 Source tree for the Android companion. There is **no APK in this workspace** and
 **nothing was device-tested**: this host has Java but no Android SDK, no Android
-NDK and no Gradle, and `kotlinc` is not installed. Kotlin changes are
-source-only and must be compiled on a machine with Android SDK/Gradle before any
-runtime claim is made.
+NDK and no Gradle, and no installed `kotlinc`. Kotlin sources were type-checked
+with the cached Kotlin 1.9.24 compiler against temporary local Android stubs;
+that is a static syntax/type check, **not** an Android build. Real compilation
+must happen on a machine with Android SDK/Gradle before any runtime claim is made.
 
 ## Status (honest)
 
@@ -22,6 +23,7 @@ runtime claim is made.
 | Accessibility injection | Implemented with guards, **hardware-unverified** | Explicit user enablement, capability toggle, pinned-peer authorization, token-bucket limit (60/s, burst 8), sticky panic disable. Raw key injection is not possible via public APIs: keys are decoded but only a HOME/BACK/RECENTS whitelist is injected. |
 | QR scanner | Source-only | Uses zxing dependency; needs camera permission/Play Services on a real device. |
 | UniFFI native library | Not present | No UDL/generated classes/`.so` in this tree. `BridgeProvider` logs and falls through; it never fabricates JNI. |
+| Kotlin static check | Passed, not an Android build | All `src/main/java/**/*.kt` compiled with cached Kotlin 1.9.24 against temporary Android/AndroidX stubs. |
 | APK build / device test | **Not done** | Android SDK/NDK/Gradle unavailable. |
 
 ## Bridge API (`com.mymouse.android.bridge`)
@@ -93,7 +95,7 @@ No emulator/device was available. On a machine with Android SDK + emulator:
 4. In Settings, open Accessibility settings and confirm the myMouse service is listed; enable it only for testing.
 5. Pairing flow: enter a 6-digit code and host id; confirm the UI requires explicit approval before storing a trusted device.
 6. QR flow: scan a `mymouse://pair?code=123456&id=host1` QR and confirm fields populate.
-7. File transfer: pick a file and confirm scaffold status message; real transfer requires a paired pinned host.
+7. File transfer: with no paired session, confirm the UI refuses and says no transfer will be attempted; then repeat with a real paired, files-enabled host to verify offer/chunk/verify.
 8. Remote screen: confirm placeholder clearly states streaming is not implemented.
 9. Capture `adb logcat` and screenshot for evidence. Do **not** claim device verification without this run.
 
