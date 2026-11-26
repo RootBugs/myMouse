@@ -16,6 +16,7 @@ use device::DeviceInfo;
 use file_transfer::{FileTransferManager, FileTransferSettings};
 use identity::Identity;
 use input::InputBridge;
+use layout::Layout;
 use mymouse_protocol::{ClipboardKind, Message, PROTOCOL_VERSION};
 use network::PeerRuntimeHandle;
 use serde::{Deserialize, Serialize};
@@ -69,16 +70,18 @@ struct AppState {
     pairing_sessions: Mutex<HashMap<String, pairing::PairSession>>,
     /// Shared capture bridge so RPCs can stop/resume local forwarding.
     input_bridge: Arc<Mutex<InputBridge>>,
+    /// Shared topology so the UI/RPCs and the OS input hook see the same state.
+    layout: Arc<RwLock<Layout>>,
 }
 
 impl AppState {
-    fn new(config_dir: PathBuf) -> Result<Self, String> {
+    pub(crate) fn new(config_dir: PathBuf) -> Result<Self, String> {
         let device = DeviceInfo::load_or_create(&config_dir)
             .map_err(|error| format!("could not load device identity: {error}"))?;
-        Ok(Self::with_device_info(config_dir, device))
+        Self::with_device_info(config_dir, device)
     }
 
-    fn with_device_id(config_dir: PathBuf, device_id: String) -> Self {
+    fn with_device_id(config_dir: PathBuf, device_id: String) -> Result<Self, String> {
         Self::with_device_info(
             config_dir,
             DeviceInfo {
@@ -88,16 +91,17 @@ impl AppState {
         )
     }
 
-    fn with_device_info(config_dir: PathBuf, device: DeviceInfo) -> Self {
+    fn with_device_info(config_dir: PathBuf, device: DeviceInfo) -> Result<Self, String> {
         let settings_path = config_dir.join("settings.json");
         let settings: AppSettings = std::fs::read_to_string(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let trust = TrustStore::load(config_dir.join("trust.json"));
+        let layout = Layout::load(config_dir.join("layout.json"))?;
         let clipboard = ClipboardManager::new(device.id.clone(), settings.clipboard.clone());
         let transfers = FileTransferManager::new(device.id.clone(), settings.file_transfer.clone());
-        Self {
+        Ok(Self {
             device_id: device.id,
             device_name: device.name,
             settings,
@@ -111,7 +115,8 @@ impl AppState {
             discovered: Arc::new(RwLock::new(HashMap::new())),
             pairing_sessions: Mutex::new(HashMap::new()),
             input_bridge: Arc::new(Mutex::new(InputBridge::new())),
-        }
+            layout: Arc::new(RwLock::new(layout)),
+        })
     }
 
     fn save_settings(&self) -> io::Result<()> {
@@ -183,6 +188,20 @@ pub(crate) fn apply_file_transfer_settings(state: &mut AppState, params: &Value)
     let settings = state.settings.file_transfer.clone();
     state.transfers.set_settings(settings);
     let _ = state.save_settings();
+}
+
+/// Validate, persist, then apply a topology. Persistence happens before the
+/// live layout changes so a failed write cannot leave hook state ahead of disk.
+fn apply_layout_params(state: &mut AppState, params: &Value) -> Result<Layout, String> {
+    let raw = params
+        .get("layout")
+        .ok_or_else(|| "missing layout".to_string())?;
+    let layout: Layout = serde_json::from_value(raw.clone())
+        .map_err(|error| format!("invalid layout: {error}"))?;
+    layout.validate()?;
+    layout.save(state.config_dir.join("layout.json"))?;
+    state.layout.write().unwrap().replace(layout.clone());
+    Ok(layout)
 }
 
 pub(crate) fn clipboard_message_from_params(
@@ -522,6 +541,13 @@ async fn handle_request(
             if !is_valid_id(peer_id) {
                 return rpc_err(id, "invalid peer device id");
             }
+            // Capture this before disconnect clears the active peer slot.
+            let was_active = {
+                let active = network.active_peer_id();
+                let current = active.lock().unwrap().clone();
+                let matches = current.as_deref() == Some(peer_id);
+                matches
+            };
             {
                 let mut st = state.lock().unwrap();
                 st.trust.revoke(peer_id);
@@ -530,6 +556,22 @@ async fn handle_request(
                 };
                 let trust_path = st.config_dir.join("trust.json");
                 let _ = st.trust.save(trust_path);
+            }
+            // Revoking a trusted peer must drop its live TLS session too.
+            // Otherwise an already-armed handoff could keep forwarding to a
+            // peer that is no longer trusted.
+            network.disconnect_peer(peer_id).await;
+            if was_active {
+                network.set_input_enabled(false);
+                if let Ok(mut bridge) = state.lock().unwrap().input_bridge.lock() {
+                    bridge.pause();
+                }
+                InputBridge::release_modifiers();
+                emit(json!({
+                    "notification": "inputState",
+                    "enabled": false,
+                    "message": "revoked peer disconnected; input returned to this PC",
+                }));
             }
             rpc_ok(id, json!({ "ok": true }));
         }
@@ -560,7 +602,25 @@ async fn handle_request(
             }
         }
         "setLayout" => {
+            let layout = {
+                let mut st = state.lock().unwrap();
+                match apply_layout_params(&mut st, &params) {
+                    Ok(layout) => layout,
+                    Err(error) => return rpc_err(id, &error),
+                }
+            };
+            match serde_json::to_value(&layout) {
+                Ok(value) => emit(json!({ "notification": "layoutChanged", "layout": value })),
+                Err(error) => return rpc_err(id, &format!("could not encode layout: {error}")),
+            }
             rpc_ok(id, json!({ "ok": true }));
+        }
+        "getLayout" => {
+            let layout = state.lock().unwrap().layout.read().unwrap().clone();
+            match serde_json::to_value(&layout) {
+                Ok(value) => rpc_ok(id, json!({ "ok": true, "layout": value })),
+                Err(error) => rpc_err(id, &format!("could not encode layout: {error}")),
+            }
         }
         "getSettings" => {
             let st = state.lock().unwrap();
@@ -751,10 +811,10 @@ async fn accept_inbound_loop(
                 "deviceId": peer_id,
                 "message": "trusted peer attached",
             }));
-            if gate_network.attach_inbound(stream, peer_id).await.is_err() {
+            if let Err(reason) = gate_network.attach_inbound(stream, peer_id).await {
                 emit(json!({
                     "notification": "listener-error",
-                    "error": "network runtime stopped",
+                    "error": reason,
                 }));
             }
         });
@@ -780,22 +840,35 @@ async fn run_ipc() -> Result<(), String> {
     let forward_network = network.clone();
     tokio::spawn(async move {
         while let Some(message) = input_rx.recv().await {
-            if forward_network.send(message).await.is_err() {
+            // Handoff frames carry the exact peer chosen by the topology
+            // crossing. Route by that ID so a second accepted connection can
+            // never receive input stamped for a different device.
+            let target = match &message {
+                Message::InputEvent { target, .. } => Some(target.clone()),
+                _ => None,
+            };
+            if forward_network.send_to(message, target).await.is_err() {
                 break;
             }
         }
     });
     let gate_network = network.clone();
     let active_peer_id = network.active_peer_id();
-    let bridge = Arc::new(Mutex::new(InputBridge::with_target_provider(
+    let (layout, local_device_id) = {
+        let st = state.lock().unwrap();
+        (st.layout.clone(), st.device_id.clone())
+    };
+    let bridge = Arc::new(Mutex::new(InputBridge::with_topology(
+        layout,
+        &local_device_id,
+        0,
         input_tx,
         Arc::new(move || gate_network.connected_now()),
         Arc::new(move || active_peer_id.lock().unwrap().clone()),
     )));
-    // Forwarding stays armed, but the hooks only swallow local input once a
-    // peer is actually connected. On a fresh install with no peer, input must
-    // keep working on this machine.
-    bridge.lock().unwrap().forwarding = true;
+    // The topology bridge starts armed but with no handoff target. Local input
+    // remains on this PC until a real MouseMove crosses a configured edge and
+    // the crossing target matches the single connected peer.
     {
         let mut st = state.lock().unwrap();
         st.input_bridge = bridge.clone();
@@ -806,7 +879,7 @@ async fn run_ipc() -> Result<(), String> {
         emit(json!({
             "notification": "inputState",
             "enabled": false,
-            "message": "escape hotkey returned input to this PC",
+            "message": "input returned to this PC",
         }));
     }));
     let _hook_task = InputBridge::start(bridge);
@@ -951,8 +1024,65 @@ mod tests {
     }
 
     #[test]
+    fn app_state_loads_persisted_layout_and_rejects_malformed_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = AppState::new(dir.path().to_path_buf()).unwrap();
+        assert!(missing.layout.read().unwrap().nodes().is_empty());
+
+        let raw = r#"{
+            "nodes": [
+                { "deviceId": "pc-a", "monitorIndex": 0, "width": 101, "height": 201 },
+                { "deviceId": "pc-b", "monitorIndex": 0, "width": 101, "height": 201 }
+            ],
+            "edges": [{ "from": "pc-a", "to": "pc-b", "side": "right" }]
+        }"#;
+        std::fs::write(dir.path().join("layout.json"), raw).unwrap();
+        let loaded = AppState::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(loaded.layout.read().unwrap().nodes().len(), 2);
+        assert_eq!(loaded.layout.read().unwrap().edges().len(), 1);
+
+        std::fs::write(dir.path().join("layout.json"), "not-json").unwrap();
+        assert!(AppState::new(dir.path().to_path_buf()).is_err());
+    }
+
+    #[test]
+    fn set_layout_params_persist_and_apply_only_when_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).unwrap();
+        let params = json!({
+            "layout": {
+                "nodes": [
+                    { "deviceId": "pc-a", "monitorIndex": 0, "width": 101, "height": 201 },
+                    { "deviceId": "pc-b", "monitorIndex": 0, "width": 101, "height": 201 }
+                ],
+                "edges": [{ "from": "pc-a", "to": "pc-b", "side": "right" }]
+            }
+        });
+
+        let applied = apply_layout_params(&mut state, &params).unwrap();
+        let disk = std::fs::read_to_string(dir.path().join("layout.json")).unwrap();
+        assert!(disk.contains("\"deviceId\""), "{disk}");
+        assert_eq!(state.layout.read().unwrap().clone(), applied);
+        assert_eq!(applied.edges().len(), 1);
+
+        let rejected = json!({
+            "layout": {
+                "nodes": [
+                    { "deviceId": "pc-a", "monitorIndex": 0, "width": 101, "height": 201 }
+                ],
+                "edges": [{ "from": "pc-a", "to": "pc-a", "side": "right" }]
+            }
+        });
+        assert!(apply_layout_params(&mut state, &rejected).is_err());
+        assert_eq!(state.layout.read().unwrap().clone(), applied);
+        let after_reject = std::fs::read_to_string(dir.path().join("layout.json")).unwrap();
+        assert_eq!(after_reject, disk);
+    }
+
+    #[test]
     fn inbound_hello_requires_trust_and_supported_version() {
-        let mut state = AppState::with_device_id(std::env::temp_dir(), "local-pc".to_string());
+        let mut state =
+            AppState::with_device_id(std::env::temp_dir(), "local-pc".to_string()).unwrap();
         state.trust.grant("pc-b", Capabilities::default());
         let pin = "c".repeat(64);
         state.trust.set_fingerprint("pc-b", pin.clone());
@@ -1032,7 +1162,8 @@ mod tests {
         .await
         .unwrap();
 
-        let mut app = AppState::with_device_id(state_dir.path().to_path_buf(), "local-pc".into());
+        let mut app =
+            AppState::with_device_id(state_dir.path().to_path_buf(), "local-pc".into()).unwrap();
         app.trust.grant("pc-b", Capabilities::default());
         app.trust.set_fingerprint("pc-b", client_fp.clone());
         let state = Arc::new(Mutex::new(app));

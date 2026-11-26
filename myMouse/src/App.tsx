@@ -4,7 +4,7 @@ import DeviceLayout from './components/DeviceLayout';
 import DeviceManagement from './components/DeviceManagement';
 import FileTransfer from './components/FileTransfer';
 import Settings from './components/Settings';
-import type { AppSettings, TransferRecord, TrustedDevice } from './types';
+import type { AppSettings, DeviceLayoutData, TransferRecord, TrustedDevice } from './types';
 import './styles.css';
 
 type Section = 'Dashboard' | 'Device layout' | 'File transfer' | 'Device management' | 'Settings';
@@ -25,19 +25,22 @@ export default function App() {
   const [devices, setDevices] = useState<TrustedDevice[]>([]);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
+  const [topology, setTopology] = useState<DeviceLayoutData>({ nodes: [], edges: [] });
 
   const refresh = useCallback(async () => {
     try {
-      const [status, deviceList, settingsResp, transferResp] = await Promise.all([
+      const [status, deviceList, settingsResp, transferResp, layoutResp] = await Promise.all([
         window.mymouse.status(),
         window.mymouse.devices(),
         window.mymouse.getSettings(),
         window.mymouse.listTransfers(),
+        window.mymouse.getLayout(),
       ]);
       setConnected(status.connected);
       setDevices(deviceList);
       if (settingsResp?.settings) setSettings(settingsResp.settings);
       if (transferResp?.transfers) setTransfers(transferResp.transfers);
+      if (layoutResp?.layout) setTopology(layoutResp.layout);
     } catch {
       // Backend may not be available in tests/dev; keep defaults.
     }
@@ -67,7 +70,7 @@ export default function App() {
       </nav>
       <main className="content">
         {section === 'Dashboard' && <Dashboard connected={connected} devices={devices} transfers={transfers} settings={settings} />}
-        {section === 'Device layout' && <DeviceLayout />}
+        {section === 'Device layout' && <DeviceLayout layout={topology} />}
         {section === 'File transfer' && <FileTransfer transfers={transfers} settings={settings} onRefresh={refresh} />}
         {section === 'Device management' && <DeviceManagement devices={devices} onRefresh={refresh} />}
         {section === 'Settings' && <Settings settings={settings} onChange={setSettings} onRefresh={refresh} />}

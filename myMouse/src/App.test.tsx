@@ -10,6 +10,7 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getLayout: async () => ({ ok: true, layout: { nodes: [], edges: [] } }),
       getSettings: async () => ({
         ok: true,
         settings: {
@@ -37,6 +38,7 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getLayout: async () => ({ ok: true, layout: { nodes: [], edges: [] } }),
       getSettings: async () => ({
         ok: true,
         settings: {
@@ -70,6 +72,7 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getLayout: async () => ({ ok: true, layout: { nodes: [], edges: [] } }),
       getSettings: async () => ({
         ok: true,
         settings: {
@@ -100,6 +103,7 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getLayout: async () => ({ ok: true, layout: { nodes: [], edges: [] } }),
       getSettings: async () => ({
         ok: true,
         settings: {
@@ -139,6 +143,7 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getLayout: async () => ({ ok: true, layout: { nodes: [], edges: [] } }),
       getSettings: async () => ({
         ok: true,
         settings: {
@@ -168,6 +173,7 @@ describe('App', () => {
       pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
       approvePairing: async () => ({ ok: true }),
       setLayout: async () => ({ ok: true }),
+      getLayout: async () => ({ ok: true, layout: { nodes: [], edges: [] } }),
       getSettings: async () => ({
         ok: true,
         settings: {
@@ -193,5 +199,44 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
     await waitFor(() => expect(resumeInput).toHaveBeenCalled());
     expect(await screen.findByText('Input enabled')).toBeInTheDocument();
+  });
+
+  it('renders the backend topology on the Device layout screen', async () => {
+    const getLayout = vi.fn(async () => ({
+      ok: true,
+      layout: {
+        nodes: [
+          { deviceId: 'pc-a', monitorIndex: 0, width: 1920, height: 1080 },
+          { deviceId: 'pc-b', monitorIndex: 0, width: 1280, height: 720 },
+        ],
+        edges: [{ from: 'pc-a', to: 'pc-b', side: 'right' }],
+      },
+    }));
+    (window as any).mymouse = {
+      status: async () => ({ ok: true, connected: true }),
+      devices: async () => [],
+      pairingUri: async () => 'mymouse://pair?code=123456&id=pc-a',
+      approvePairing: async () => ({ ok: true }),
+      setLayout: async () => ({ ok: true }),
+      getLayout,
+      getSettings: async () => ({
+        ok: true,
+        settings: {
+          clipboard: { enabled: true, mode: 'global' },
+          file_transfer: { auto_accept: false, save_dir: '', max_transfer_bytes: 100 * 1024 * 1024 },
+          auto_reconnect: true,
+          launch_at_start: false,
+          quick_drop_enabled: true,
+        },
+      }),
+      listTransfers: async () => ({ ok: true, transfers: [] }),
+    };
+
+    render(<App />);
+    expect(await screen.findByText('Connected')).toBeInTheDocument();
+    expect(getLayout).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Device layout' }));
+    expect(await screen.findByText('pc-a : 0')).toBeInTheDocument();
+    expect(screen.getByText('pc-b : 0')).toBeInTheDocument();
   });
 });

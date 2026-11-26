@@ -1,8 +1,8 @@
-use crate::layout::escape_hotkey;
+use crate::layout::{escape_hotkey, Layout};
 use mymouse_protocol::Message;
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -248,6 +248,16 @@ pub fn set_stop_callback(callback: Arc<dyn Fn() + Send + Sync>) {
 
 type TargetProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Live handoff state for the topology-aware production bridge. `None` means
+/// ordinary local input stays on this machine; only a configured edge crossing
+/// can populate `handoff_target`.
+struct TopologyControl {
+    layout: Arc<RwLock<Layout>>,
+    local_device_id: String,
+    monitor_index: u32,
+    handoff_target: Option<String>,
+}
+
 pub struct InputBridge {
     pub forwarding: bool,
     target_provider: TargetProvider,
@@ -255,6 +265,7 @@ pub struct InputBridge {
     /// Production gate: local input is only consumed when a peer is actually
     /// connected. Test mode leaves this unset and keeps its existing behavior.
     connection_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    topology: Option<TopologyControl>,
 }
 
 impl Default for InputBridge {
@@ -270,6 +281,7 @@ impl InputBridge {
             target_provider: Arc::new(|| None),
             outgoing: None,
             connection_gate: None,
+            topology: None,
         }
     }
 
@@ -308,17 +320,58 @@ impl InputBridge {
             target_provider,
             outgoing: Some(outgoing),
             connection_gate: Some(gate),
+            topology: None,
+        }
+    }
+
+    /// Production constructor. Ordinary input stays local until a `MouseMove`
+    /// crosses a configured edge of the local monitor. The crossing event is
+    /// sent once with target coordinates scaled by `Layout`, then subsequent
+    /// events are forwarded to that same peer until Escape/local stop.
+    pub fn with_topology(
+        layout: Arc<RwLock<Layout>>,
+        local_device_id: &str,
+        monitor_index: u32,
+        outgoing: mpsc::UnboundedSender<Message>,
+        gate: Arc<dyn Fn() -> bool + Send + Sync>,
+        target_provider: TargetProvider,
+    ) -> Self {
+        Self {
+            forwarding: true,
+            target_provider,
+            outgoing: Some(outgoing),
+            connection_gate: Some(gate),
+            topology: Some(TopologyControl {
+                layout,
+                local_device_id: local_device_id.to_string(),
+                monitor_index,
+                handoff_target: None,
+            }),
         }
     }
 
     /// True only while forwarding is enabled and there is a peer to receive it.
+    /// In topology mode this additionally requires an active handoff to that
+    /// exact peer, so connecting alone never swallows local input.
     pub fn active(&self) -> bool {
-        self.forwarding
-            && self
+        if !self.forwarding
+            || !self
                 .connection_gate
                 .as_ref()
                 .map(|gate| gate())
                 .unwrap_or(true)
+        {
+            return false;
+        }
+        match &self.topology {
+            Some(topology) => {
+                let Some(target) = (self.target_provider)() else {
+                    return false;
+                };
+                topology.handoff_target.as_deref() == Some(target.as_str())
+            }
+            None => true,
+        }
     }
 
     /// Handle a locally captured event. Returns whether the OS hook should
@@ -328,6 +381,9 @@ impl InputBridge {
         if let CapturedEvent::Hotkey(name) = &event {
             if *name == escape_hotkey() {
                 self.forwarding = false;
+                if let Some(topology) = &mut self.topology {
+                    topology.handoff_target = None;
+                }
                 // Release stuck modifiers without typing the hotkey itself,
                 // and close the remote injection gate if production wired it.
                 Self::release_modifiers();
@@ -338,25 +394,96 @@ impl InputBridge {
             }
         }
 
-        if !self.active() {
+        let connected = self
+            .connection_gate
+            .as_ref()
+            .map(|gate| gate())
+            .unwrap_or(true);
+        if !self.forwarding || !connected {
+            if let Some(topology) = &mut self.topology {
+                topology.handoff_target = None;
+            }
             return false;
         }
 
-        let Some(target) = (self.target_provider)() else {
+        let current_target = (self.target_provider)();
+        let mut crossing_event = None;
+        if let Some(topology) = &mut self.topology {
+            if let Some(handoff) = &topology.handoff_target {
+                if current_target.as_deref() != Some(handoff.as_str()) {
+                    topology.handoff_target = None;
+                    return false;
+                }
+            }
+            if topology.handoff_target.is_none() {
+                if let CapturedEvent::MouseMove { x, y } = &event {
+                    if *x >= 0 && *y >= 0 {
+                        let crossing = topology.layout.read().unwrap().cross_from_index(
+                            &topology.local_device_id,
+                            topology.monitor_index,
+                            *x as u32,
+                            *y as u32,
+                        );
+                        if let Some(crossing) = crossing {
+                            if current_target.as_deref() == Some(crossing.target.as_str()) {
+                                topology.handoff_target = Some(crossing.target.clone());
+                                crossing_event = Some(CapturedEvent::MouseMove {
+                                    x: crossing.x as i32,
+                                    y: crossing.y as i32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(crossed) = crossing_event {
+            return self.send_event(crossed, current_target);
+        }
+        if self
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.handoff_target.is_none())
+        {
             return false;
+        }
+        self.send_event(event, current_target)
+    }
+
+    fn send_event(&mut self, event: CapturedEvent, target: Option<String>) -> bool {
+        let sent = if let (Some(outgoing), Some(target)) = (&self.outgoing, target) {
+            let payload = bincode::serialize(&event).unwrap_or_default();
+            outgoing.send(Message::InputEvent { target, payload }).is_ok()
+        } else {
+            false
         };
-        let Some(outgoing) = &self.outgoing else {
-            return false;
-        };
-        let payload = bincode::serialize(&event).unwrap_or_default();
-        let _ = outgoing.send(Message::InputEvent { target, payload });
-        true
+        if sent {
+            return true;
+        }
+        // A dead forwarding channel must never swallow local input. Clear the
+        // handoff and pause capture so the OS passes every event through until
+        // the user explicitly resumes.
+        self.forwarding = false;
+        if let Some(topology) = &mut self.topology {
+            topology.handoff_target = None;
+        }
+        // A peer may be holding a modifier while the channel dies. Use the same
+        // cleanup as the local escape so it cannot stay stuck after we return
+        // control to this machine.
+        Self::release_modifiers();
+        if let Some(callback) = STOP_CALLBACK.get() {
+            callback();
+        }
+        false
     }
 
     /// Emergency pause: close local capture without tearing down the OS hooks.
     /// The hooks stay installed but pass every event through until `resume`.
     pub fn pause(&mut self) {
         self.forwarding = false;
+        if let Some(topology) = &mut self.topology {
+            topology.handoff_target = None;
+        }
     }
 
     /// Re-enable local capture after `pause` without restarting the process.
@@ -821,6 +948,30 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{Edge, Layout, Node, Side};
+    use std::sync::RwLock;
+
+    fn topology_layout() -> Arc<RwLock<Layout>> {
+        let mut layout = Layout::new();
+        layout.add_node(Node::monitor("pc-a", 0, 101, 201));
+        layout.add_node(Node::monitor("pc-b", 0, 202, 101));
+        layout.set_edge(Edge {
+            from: "pc-a".into(),
+            to: "pc-b".into(),
+            side: Side::Right,
+        });
+        Arc::new(RwLock::new(layout))
+    }
+
+    fn assert_input_event(message: Message, expected_target: &str) -> CapturedEvent {
+        match message {
+            Message::InputEvent { target, payload } => {
+                assert_eq!(target, expected_target);
+                bincode::deserialize::<CapturedEvent>(&payload).unwrap()
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 
     #[test]
     fn translates_ctrl_c_to_command_c_on_mac_target() {
@@ -1039,5 +1190,190 @@ mod tests {
         *active_peer.lock().unwrap() = None;
         assert!(!bridge.handle(CapturedEvent::MouseMove { x: 5, y: 6 }));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn topology_bridge_keeps_local_input_until_a_configured_crossing() {
+        // Regression: merely connecting a peer armed production forwarding, so
+        // every local click and keystroke went to the peer from the first frame.
+        let active_peer = Arc::new(Mutex::new(Some("pc-b".to_string())));
+        let peer_for_bridge = active_peer.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_topology(
+            topology_layout(),
+            "pc-a",
+            0,
+            tx,
+            Arc::new(|| true),
+            Arc::new(move || peer_for_bridge.lock().unwrap().clone()),
+        );
+
+        let key = CapturedEvent::Key {
+            key: "A".into(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            down: true,
+        };
+        assert!(!bridge.handle(key.clone()));
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
+        assert!(rx.try_recv().is_err());
+
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert_eq!(
+            assert_input_event(rx.try_recv().unwrap(), "pc-b"),
+            CapturedEvent::MouseMove { x: 0, y: 50 }
+        );
+
+        assert!(bridge.handle(key.clone()));
+        assert_eq!(assert_input_event(rx.try_recv().unwrap(), "pc-b"), key);
+    }
+
+    #[test]
+    fn topology_crossing_requires_a_connected_matching_peer() {
+        let active_peer = Arc::new(Mutex::new(Some("pc-c".to_string())));
+        let connected = Arc::new(Mutex::new(true));
+        let peer_for_bridge = active_peer.clone();
+        let connected_for_bridge = connected.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_topology(
+            topology_layout(),
+            "pc-a",
+            0,
+            tx,
+            Arc::new(move || *connected_for_bridge.lock().unwrap()),
+            Arc::new(move || peer_for_bridge.lock().unwrap().clone()),
+        );
+
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_err());
+
+        *active_peer.lock().unwrap() = Some("pc-b".to_string());
+        *connected.lock().unwrap() = false;
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_err());
+
+        *connected.lock().unwrap() = true;
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn topology_handoff_stops_when_the_peer_changes_or_disconnects() {
+        let active_peer = Arc::new(Mutex::new(Some("pc-b".to_string())));
+        let peer_for_bridge = active_peer.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_topology(
+            topology_layout(),
+            "pc-a",
+            0,
+            tx,
+            Arc::new(|| true),
+            Arc::new(move || peer_for_bridge.lock().unwrap().clone()),
+        );
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+
+        *active_peer.lock().unwrap() = None;
+        assert!(!bridge.handle(CapturedEvent::Key {
+            key: "B".into(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            down: true,
+        }));
+        assert!(rx.try_recv().is_err());
+
+        *active_peer.lock().unwrap() = Some("pc-c".to_string());
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
+        assert!(rx.try_recv().is_err());
+
+        // Returning the original peer must not silently restore control; a new
+        // crossing is required.
+        *active_peer.lock().unwrap() = Some("pc-b".to_string());
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
+        assert!(rx.try_recv().is_err());
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn escape_and_resume_require_a_new_topology_crossing() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_topology(
+            topology_layout(),
+            "pc-a",
+            0,
+            tx,
+            Arc::new(|| true),
+            Arc::new(|| Some("pc-b".to_string())),
+        );
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+
+        assert!(bridge.handle(CapturedEvent::Hotkey(escape_hotkey())));
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
+        assert!(rx.try_recv().is_err());
+
+        bridge.resume();
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
+        assert!(rx.try_recv().is_err());
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn pause_during_handoff_returns_input_to_the_local_machine() {
+        // The revoke RPC disconnects the peer and pauses the bridge. Even if
+        // the peer ID is still cached for a moment, every captured event must
+        // stay local until a fresh edge crossing re-arms the handoff.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut bridge = InputBridge::with_topology(
+            topology_layout(),
+            "pc-a",
+            0,
+            tx,
+            Arc::new(|| true),
+            Arc::new(|| Some("pc-b".to_string())),
+        );
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+
+        bridge.pause();
+        assert!(!bridge.active());
+        assert!(!bridge.handle(CapturedEvent::Key {
+            key: "A".into(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            down: true,
+        }));
+        assert!(rx.try_recv().is_err());
+
+        bridge.resume();
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
+        assert!(rx.try_recv().is_err());
+        assert!(bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn topology_crossing_never_suppresses_local_input_when_the_send_fails() {
+        // Regression: the bridge reported success even after the forwarding
+        // channel was gone, so a dead sender could swallow all local input.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let mut bridge = InputBridge::with_topology(
+            topology_layout(),
+            "pc-a",
+            0,
+            tx,
+            Arc::new(|| true),
+            Arc::new(|| Some("pc-b".to_string())),
+        );
+
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 100, y: 100 }));
+        assert!(!bridge.active());
+        assert!(!bridge.handle(CapturedEvent::MouseMove { x: 10, y: 20 }));
     }
 }

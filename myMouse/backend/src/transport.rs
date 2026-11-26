@@ -356,6 +356,17 @@ impl PeerWriter {
 }
 
 impl PeerStream {
+    /// Test-only stream for exercising runtime command sequencing without a
+    /// real TLS handshake. Never compiled into production builds.
+    #[cfg(test)]
+    pub(crate) fn from_test_duplex(stream: tokio::io::DuplexStream) -> Self {
+        Self {
+            stream: Box::new(stream),
+            connected: true,
+            peer_fingerprint: None,
+        }
+    }
+
     fn from_client(tls: ClientTlsStream<TcpStream>) -> Self {
         Self {
             stream: Box::new(tls),

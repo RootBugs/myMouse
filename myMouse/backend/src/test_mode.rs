@@ -168,7 +168,7 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
     let state = Arc::new(Mutex::new(AppState::with_device_id(
         config_dir(),
         device_id.clone(),
-    )));
+    )?));
     // Test mode has no interactive pairing; grant the statically configured
     // peer full capabilities so the same dispatch gates can be exercised.
     {

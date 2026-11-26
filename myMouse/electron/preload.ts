@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('mymouse', {
   approvePairing: (code: string, peerId: string, fingerprint: string, verified: boolean) =>
     ipcRenderer.invoke('mymouse:call', 'approvePairing', { code, peerId, fingerprint, verified }),
   setLayout: (layout: unknown) => ipcRenderer.invoke('mymouse:call', 'setLayout', { layout }),
+  getLayout: () => ipcRenderer.invoke('mymouse:call', 'getLayout'),
 
   getSettings: () => ipcRenderer.invoke('mymouse:call', 'getSettings'),
   setClipboardSettings: (settings: { enabled?: boolean; mode?: 'global' | 'cursor_scoped' }) =>

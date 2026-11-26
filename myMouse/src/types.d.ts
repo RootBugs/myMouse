@@ -52,6 +52,26 @@ export interface TrustedDevice {
   capabilities?: DeviceCapabilities;
 }
 
+export type LayoutSide = 'left' | 'right' | 'top' | 'bottom';
+
+export interface LayoutNode {
+  deviceId: string;
+  monitorIndex: number;
+  width: number;
+  height: number;
+}
+
+export interface LayoutEdge {
+  from: string;
+  to: string;
+  side: LayoutSide;
+}
+
+export interface DeviceLayoutData {
+  nodes: LayoutNode[];
+  edges: LayoutEdge[];
+}
+
 declare global {
   interface Window {
     mymouse: {
@@ -60,7 +80,8 @@ declare global {
       pairingUri: () => Promise<string>;
       approvePairing: (code: string, peerId: string, fingerprint: string, verified: boolean) =>
         Promise<{ ok: boolean; error?: string }>;
-      setLayout: (layout: unknown) => Promise<{ ok: boolean }>;
+      setLayout: (layout: DeviceLayoutData) => Promise<{ ok: boolean; error?: string }>;
+      getLayout: () => Promise<{ ok: boolean; layout: DeviceLayoutData; error?: string }>;
 
       getSettings: () => Promise<{ ok: boolean; settings: AppSettings }>;
       setClipboardSettings: (settings: { enabled?: boolean; mode?: 'global' | 'cursor_scoped' }) =>

@@ -8,9 +8,11 @@ from-scratch alternative, not a wrapper around any installed application.
 two-instance pinned-TLS harness on this host.** Clipboard updates, small file
 transfers, and a synthetic cursor crossing travel between two real backend
 processes over the existing v2 pinned-TLS transport; the UI sends clipboard text
-and offers/accepts files and refreshes on backend notifications. No two *separate
-physical* PCs were available here, so that remains harness-verified rather than
-field-verified. Live production edge-crossing handoff is not wired yet; see the
+and offers/accepts files and refreshes on backend notifications. Production now
+also has topology-backed `MouseMove` edge handoff, but it is unit-tested and
+wired to the live Windows hook path — not physically tested. No two *separate
+physical* PCs were available here, so all two-machine behaviour remains
+harness-verified rather than field-verified. See the
 [Phase 1 audit](docs/phase1-audit.md).
 
 Android (`apps/android/`) and the Rust FFI crate (`shared/android-bridge/`) are
@@ -24,8 +26,9 @@ is provided.
 
 ## What is included
 
-- Electron + React desktop UI with a device dashboard, adjacency layout editor,
-  and device-management panel.
+- Electron + React desktop UI with a device dashboard, backend-driven adjacency
+  layout view, and device-management panel. The view renders persisted topology;
+  there is not yet a full drag-and-drop editor.
 - Persistent per-install identity: a stable UUID and system-derived device name
   are stored in `device.json`. `Hello`, `localIdentity`, and mDNS discovery carry
   the real name; production input events are stamped with the connected peer's
@@ -147,12 +150,23 @@ it, it will require your explicit action.
 
 ## Control and layout
 
-- Each physical monitor is a node. The adjacency layout editor models nodes and
-  edges; production layout persistence (`setLayout`) and live edge-crossing
-  handoff are still pending, so the layout view is currently static.
-- `Layout::cross()` implements and unit-tests edge-crossing math. The
-  two-instance harness verifies a synthetic crossing forwarded to one peer over
-  pinned TLS, but no live Windows cursor boundary is wired yet.
+- Each physical monitor is a node. `layout.json` lives beside `device.json` in
+  the per-user config directory. `setLayout` validates the topology, writes it
+  atomically, applies it to the live hook, and emits `layoutChanged`;
+  `getLayout` returns the current state to the UI. Missing `layout.json` means an
+  empty layout; malformed or invalid JSON is an error, not silently replaced.
+- A topology has `nodes` (`deviceId`, `monitorIndex`, `width`, `height`) and
+  `edges` (`from`, `to`, `side`). IDs, dimensions, unique monitor slots, unique
+  source/side edges, and edge endpoints are validated before persistence.
+- `Layout::cross_from_index()` uses the shared crossing math. The production
+  input bridge starts with no handoff target: ordinary captured input stays on
+  this PC. A captured `MouseMove` that crosses a configured edge sends exactly
+  one scaled move to the single connected peer whose ID matches the edge target,
+  then forwards subsequent events to that peer until Escape/local stop. With no
+  peer, a different peer, or after pause/escape, no handoff occurs.
+- The two-instance harness still verifies a synthetic crossing forwarded to one
+  peer over pinned TLS. Live Windows cursor handoff is implemented and
+  unit-tested but has not been validated on two physical machines.
 - Only one input source is active at a time. Injected events are filtered from
   capture so control cannot loop back.
 - **Emergency stop:** Dashboard → **Emergency stop** pauses capture without
@@ -190,10 +204,12 @@ See [docs/limitations.md](docs/limitations.md). In short:
   test-mode notifications, not by a hardware-level audit.
 - Windows capture/injection now maps key down/up, mouse buttons (including
   X1/X2), wheel events, canonical modifier/navigation/function keys, and exact
-  `VK(n)` values. Complex layouts, IMEs, dead keys, per-monitor DPI compensation,
-  and live production cursor handoff remain incomplete.
-- Production `setLayout` is still a no-op and the React layout view is static;
-  only unit-tested crossing math and the synthetic harness crossing exist today.
+  `VK(n)` values. Complex layouts, IMEs, dead keys, and per-monitor DPI
+  compensation remain incomplete.
+- Production topology persistence and one-peer edge handoff are implemented and
+  unit-tested, but there was no second physical PC/tablet to validate a live
+  cursor crossing, multi-monitor geometry, or return-to-local movement. The
+  layout view renders backend state; it is not a full visual editor.
 - Android is source-only with a real pinned-TLS bridge implementation (no APK
   or device test: no Android SDK/NDK/Gradle); Mac is source-only on Windows.
 - Builds are unsigned; autostart is off until you enable it.

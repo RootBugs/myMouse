@@ -8,7 +8,14 @@ Last accuracy pass: 2026-11-27. Scope statements below distinguish what was
 
 - **UAC prompts, the secure desktop, and locked sessions are out of scope for v1.** Windows does not deliver low-level input hooks to processes running at a different integrity level or on the secure desktop. myMouse will not inject into those surfaces. Unlock the PC and use the local keyboard/mouse there.
 - **Emergency stop** (Dashboard → **Emergency stop**) pauses input capture without unhooking OS hooks and releases held modifiers so control returns to the host. **Resume input** reopens capture cleanly. Hotkey events are rejected from the wire; only a locally captured hotkey can trigger the escape, and no raw keystroke bytes are logged in input notifications.
-- Only one input source is active at a time. Locally captured events are forwarded while forwarding is active; remote events from the peer are applied with `SendInput` only when the gate is open, the target exactly matches this device, capability is granted, and the 250 events/s budget is not exceeded. Injected events are filtered from the capture hooks to prevent loops. These gates are code/test verified; no hardware-level injection audit was performed here.
+- Only one input source is active at a time. In topology mode, ordinary locally
+  captured events stay local until a configured edge crossing hands off to the
+  single connected peer; after handoff, events are forwarded only to that peer.
+  Remote events from the peer are applied with `SendInput` only when the gate is
+  open, the target exactly matches this device, capability is granted, and the
+  250 events/s budget is not exceeded. Injected events are filtered from the
+  capture hooks to prevent loops. These gates are code/test verified; no
+  hardware-level injection audit was performed here.
 - Windows capture/injection now share one key vocabulary: modifiers, navigation
   keys, F1–F24, common special keys, and exact `VK(n)` values (`1..=255`) map to
   stable names in both directions. Key down/up, mouse buttons (including X1/X2),
@@ -16,10 +23,13 @@ Last accuracy pass: 2026-11-27. Scope statements below distinguish what was
   keys remain incomplete, and macOS translation still covers only Ctrl→Cmd /
   Alt→Option.
 - Mouse injection uses absolute virtual-screen coordinates. Multi-monitor layouts are modelled, but per-monitor DPI scaling at handoff is not yet compensated for.
-- Production edge detection and cursor handoff are **not wired**: `setLayout` is
-  a no-op, the React layout view is static, and no live Windows mouse-hook
-  crossing sends control to a peer. The two-instance harness verifies a
-  synthetic crossing over pinned TLS only.
+- Production topology persistence and edge handoff are implemented: `setLayout`
+  validates and atomically stores `layout.json`, updates the live hook state, and
+  `getLayout` feeds the React view. A captured `MouseMove` crossing sends one
+  scaled event to the matching connected peer and then forwards to that peer
+  until Escape/local stop. This is unit-tested and wired to the Windows hook
+  path, but no live cursor crossing was exercised on two physical machines; the
+  two-instance harness still uses a synthetic crossing over pinned TLS.
 
 ## Clipboard and file transfer
 

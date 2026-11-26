@@ -102,7 +102,14 @@ struct Connection {
 enum RuntimeCommand {
     Send {
         message: Message,
+        /// Explicit destination for topology handoff frames. `None` keeps the
+        /// legacy outbound-first one-peer selection for other message classes.
+        target: Option<String>,
         ack: oneshot::Sender<Result<(), String>>,
+    },
+    DisconnectPeer {
+        peer_device_id: String,
+        ack: oneshot::Sender<()>,
     },
     AttachOutbound {
         stream: PeerStream,
@@ -112,7 +119,7 @@ enum RuntimeCommand {
     AttachInbound {
         stream: PeerStream,
         peer_device_id: String,
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     ConnectionClosed { key: PeerKey, generation: u64 },
     Status {
@@ -170,16 +177,40 @@ impl PeerRuntimeHandle {
     /// framed write completes, so callers keep the same error semantics as a
     /// direct `PeerStream::send`.
     pub async fn send(&self, message: Message) -> Result<(), String> {
+        self.send_to(message, None).await
+    }
+
+    /// Queue a message for one named peer. Topology handoff uses this so the
+    /// frame stamped with the handoff target can never be delivered to a
+    /// different accepted connection.
+    pub async fn send_to(&self, message: Message, target: Option<String>) -> Result<(), String> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::Send {
                 message,
+                target,
                 ack: ack_tx,
             })
             .map_err(|_| "network runtime stopped".to_string())?;
         ack_rx
             .await
             .map_err(|_| "network runtime stopped".to_string())?
+    }
+
+    /// Drop every connection owned by a peer and clear the active handoff
+    /// target. Used when trust is revoked for the currently connected peer.
+    pub async fn disconnect_peer(&self, peer_device_id: &str) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .commands
+            .send(RuntimeCommand::DisconnectPeer {
+                peer_device_id: peer_device_id.to_string(),
+                ack: ack_tx,
+            })
+            .is_ok()
+        {
+            let _ = ack_rx.await;
+        }
     }
 
     pub async fn connected(&self) -> bool {
@@ -223,7 +254,7 @@ impl PeerRuntimeHandle {
             .map_err(|_| "network runtime stopped".to_string())?;
         ack_rx
             .await
-            .map_err(|_| "network runtime stopped".to_string())
+            .map_err(|_| "network runtime stopped".to_string())?
     }
 
     /// Connect with an explicit certificate fingerprint. The transport's
@@ -249,6 +280,37 @@ impl PeerRuntimeHandle {
     pub fn shutdown(&self) {
         let _ = self.commands.send(RuntimeCommand::Shutdown);
     }
+}
+
+/// Choose exactly one connection for an outbound frame. An explicit target
+/// wins over every other selection rule so a handoff frame cannot be delivered
+/// to a peer whose device ID does not match the frame.
+fn select_send_key(
+    connections: &HashMap<PeerKey, Connection>,
+    target: Option<&str>,
+) -> Option<PeerKey> {
+    if let Some(target) = target {
+        return connections
+            .iter()
+            .find(|(_, connection)| connection.peer_device_id == target)
+            .map(|(key, _)| *key);
+    }
+    if connections.contains_key(&PeerKey::Outbound) {
+        Some(PeerKey::Outbound)
+    } else {
+        connections.keys().copied().next()
+    }
+}
+
+fn peer_keys_for_device(
+    connections: &HashMap<PeerKey, Connection>,
+    peer_device_id: &str,
+) -> Vec<PeerKey> {
+    connections
+        .iter()
+        .filter(|(_, connection)| connection.peer_device_id == peer_device_id)
+        .map(|(key, _)| *key)
+        .collect()
 }
 
 struct PeerRuntime {
@@ -337,27 +399,59 @@ impl PeerRuntime {
 
     fn handle_command(&mut self, command: RuntimeCommand) {
         match command {
-            RuntimeCommand::Send { message, ack } => {
-                let target = if self.connections.contains_key(&PeerKey::Outbound) {
-                    Some(PeerKey::Outbound)
-                } else {
-                    self.connections.keys().copied().next()
-                };
-                let Some(target) = target else {
-                    let _ = ack.send(Err("no peer connected".into()));
+            RuntimeCommand::Send {
+                message,
+                target,
+                ack,
+            } => {
+                let targeted = target.is_some();
+                let Some(key) = select_send_key(&self.connections, target.as_deref()) else {
+                    // A handoff frame addressed to a peer that was revoked or
+                    // disconnected while it was queued is a dropped frame, not
+                    // a fatal transport error. Breaking the single forwarding
+                    // task here would strand every later crossing with no
+                    // consumer until the app restarted.
+                    let result = if targeted {
+                        Ok(())
+                    } else {
+                        Err("no peer connected".into())
+                    };
+                    let _ = ack.send(result);
                     return;
                 };
                 // Send to exactly one peer: broadcasting a file offer or a
                 // clipboard update to every accepted connection would leak
-                // data to peers that did not request it.
-                if let Some(connection) = self.connections.get(&target) {
-                    let _ = connection.tx.send(OutgoingFrame {
-                        message,
-                        ack: Some(ack),
-                    });
+                // data to peers that did not request it. An explicit target
+                // keeps handoff frames from crossing peer connections.
+                if let Some(connection) = self.connections.get(&key) {
+                    // Handoff frames are best-effort. Resolve their ack here
+                    // instead of in the writer task so a concurrent disconnect
+                    // cannot drop the ack and permanently kill the forwarding
+                    // task. Other messages still wait for the framed write.
+                    let ack = if targeted {
+                        let _ = ack.send(Ok(()));
+                        None
+                    } else {
+                        Some(ack)
+                    };
+                    let _ = connection.tx.send(OutgoingFrame { message, ack });
                 } else {
                     let _ = ack.send(Err("no peer connected".into()));
                 }
+            }
+            RuntimeCommand::DisconnectPeer {
+                peer_device_id,
+                ack,
+            } => {
+                for key in peer_keys_for_device(&self.connections, &peer_device_id) {
+                    if let Some(connection) = self.connections.remove(&key) {
+                        for task in connection.tasks {
+                            task.abort();
+                        }
+                    }
+                }
+                self.refresh_active_peer();
+                let _ = ack.send(());
             }
             RuntimeCommand::AttachOutbound {
                 stream,
@@ -402,6 +496,22 @@ impl PeerRuntime {
                 peer_device_id,
                 ack,
             } => {
+                // Hello authorization and stream attachment run in separate
+                // tasks, so trust can be revoked between them. This command is
+                // serialized with DisconnectPeer on the same channel, making
+                // this the authoritative moment to re-check: a peer revoked
+                // after its handshake must never become a live connection.
+                let still_trusted = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .trust
+                    .capabilities(&peer_device_id)
+                    .is_some();
+                if !still_trusted {
+                    let _ = ack.send(Err("peer no longer trusted".into()));
+                    return;
+                }
                 let key = PeerKey::Accepted(self.next_accepted);
                 self.next_accepted += 1;
                 self.next_generation += 1;
@@ -427,7 +537,7 @@ impl PeerRuntime {
                 if !self.connections.contains_key(&PeerKey::Outbound) {
                     *self.active_peer_id.lock().unwrap() = Some(peer_device_id);
                 }
-                let _ = ack.send(());
+                let _ = ack.send(Ok(()));
             }
             RuntimeCommand::ConnectionClosed { key, generation } => {
                 // A stale reader must never remove the replacement connection.
@@ -439,24 +549,7 @@ impl PeerRuntime {
                             task.abort();
                         }
                     }
-                    // The last peer disappearing means no further chunks can
-                    // arrive for its in-flight files. Remove the `.part` files
-                    // instead of leaving them on disk indefinitely.
-                    if self.connections.is_empty() {
-                        // No peer left: release local input immediately instead
-                        // of leaving the OS hooks swallowing every event.
-                        self.peer_connected.store(false, Ordering::SeqCst);
-                        *self.active_peer_id.lock().unwrap() = None;
-                        let mut state = self.state.lock().unwrap();
-                        state.transfers.cleanup_disconnected_peer();
-                    } else {
-                        let next = self
-                            .connections
-                            .get(&PeerKey::Outbound)
-                            .or_else(|| self.connections.values().next())
-                            .map(|connection| connection.peer_device_id.clone());
-                        *self.active_peer_id.lock().unwrap() = next;
-                    }
+                    self.refresh_active_peer();
                 }
             }
             RuntimeCommand::Status { ack } => {
@@ -466,6 +559,27 @@ impl PeerRuntime {
                 self.peer_connected.store(false, Ordering::SeqCst);
                 *self.active_peer_id.lock().unwrap() = None;
             }
+        }
+    }
+
+    /// Recompute the synchronous mirrors that the hook thread and RPC layer
+    /// read without async access. The last peer disappearing must release local
+    /// input and clean up its in-flight transfers; any surviving peer becomes
+    /// the single active target so handoff frames have one destination.
+    fn refresh_active_peer(&mut self) {
+        if self.connections.is_empty() {
+            self.peer_connected.store(false, Ordering::SeqCst);
+            *self.active_peer_id.lock().unwrap() = None;
+            let mut state = self.state.lock().unwrap();
+            state.transfers.cleanup_disconnected_peer();
+        } else {
+            self.peer_connected.store(true, Ordering::SeqCst);
+            let next = self
+                .connections
+                .get(&PeerKey::Outbound)
+                .or_else(|| self.connections.values().next())
+                .map(|connection| connection.peer_device_id.clone());
+            *self.active_peer_id.lock().unwrap() = next;
         }
     }
 
@@ -805,6 +919,203 @@ mod tests {
 
     fn caps() -> Capabilities {
         Capabilities::default()
+    }
+
+    fn connection(peer_device_id: &str) -> Connection {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Connection {
+            tx,
+            tasks: Vec::new(),
+            generation: 0,
+            peer_device_id: peer_device_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn select_send_key_routes_to_explicit_target() {
+        let mut connections = HashMap::new();
+        connections.insert(PeerKey::Accepted(1), connection("pc-a"));
+        connections.insert(PeerKey::Accepted(2), connection("pc-b"));
+
+        assert_eq!(
+            select_send_key(&connections, Some("pc-b")),
+            Some(PeerKey::Accepted(2))
+        );
+        assert_eq!(select_send_key(&connections, Some("pc-c")), None);
+        assert_eq!(
+            select_send_key(&connections, Some("pc-a")),
+            Some(PeerKey::Accepted(1))
+        );
+
+        // Default sends keep the existing outbound-first one-peer behaviour.
+        connections.insert(PeerKey::Outbound, connection("pc-a"));
+        assert_eq!(select_send_key(&connections, None), Some(PeerKey::Outbound));
+        assert_eq!(
+            select_send_key(&connections, Some("pc-b")),
+            Some(PeerKey::Accepted(2))
+        );
+    }
+
+    #[test]
+    fn peer_keys_for_device_matches_only_the_named_peer() {
+        let mut connections = HashMap::new();
+        connections.insert(PeerKey::Outbound, connection("pc-a"));
+        connections.insert(PeerKey::Accepted(1), connection("pc-b"));
+
+        assert_eq!(peer_keys_for_device(&connections, "pc-b"), vec![PeerKey::Accepted(1)]);
+        assert!(peer_keys_for_device(&connections, "missing").is_empty());
+    }
+
+    fn test_runtime(
+        state: Arc<Mutex<crate::AppState>>,
+    ) -> (PeerRuntime, Arc<AtomicBool>, Arc<Mutex<Option<String>>>) {
+        let peer_connected = Arc::new(AtomicBool::new(false));
+        let active_peer_id = Arc::new(Mutex::new(None));
+        let (command_sender, commands) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let runtime = PeerRuntime {
+            state,
+            local_device_id: "pc-a".into(),
+            peer_device_id: "pc-b".into(),
+            os_integration: false,
+            commands,
+            command_sender,
+            inbound_rx,
+            inbound_tx,
+            connections: HashMap::new(),
+            next_accepted: 0,
+            next_generation: 1,
+            active_outbound_generation: 1,
+            input_gate: Arc::new(AtomicBool::new(true)),
+            peer_connected: peer_connected.clone(),
+            active_peer_id: active_peer_id.clone(),
+            last_input_window: Instant::now(),
+            input_events_in_window: 0,
+        };
+        (runtime, peer_connected, active_peer_id)
+    }
+
+    #[test]
+    fn disconnect_peer_clears_active_handoff_state() {
+        // Regression: revoking a connected peer removed trust but left the
+        // runtime mirrors set, so the hook kept swallowing local input for a
+        // peer that was no longer trusted.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, peer_connected, active_peer_id) = test_runtime(state);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        peer_connected.store(true, Ordering::SeqCst);
+        *active_peer_id.lock().unwrap() = Some("pc-b".into());
+
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::DisconnectPeer {
+            peer_device_id: "pc-b".into(),
+            ack: ack_tx,
+        });
+
+        assert!(runtime.connections.is_empty());
+        assert!(!peer_connected.load(Ordering::SeqCst));
+        assert!(active_peer_id.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_target_send_to_missing_peer_is_dropped_not_fatal() {
+        // Regression: a handoff frame can be queued just as its peer is revoked
+        // or disconnected. Treating that as a transport error killed the single
+        // forwarding task, leaving later crossings with no consumer at all.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::Send {
+            message: Message::Hello {
+                version: 2,
+                device_id: "pc-a".into(),
+                name: "A".into(),
+            },
+            target: Some("revoked-peer".into()),
+            ack: ack_tx,
+        });
+        assert!(ack_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_target_send_acks_without_waiting_for_writer() {
+        // Regression: the writer task owns the ack sender. If a disconnect
+        // aborts it while a handoff frame is queued, the ack is dropped and the
+        // forwarding task sees "runtime stopped" and exits permanently.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Accepted(1),
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::Send {
+            message: Message::Hello {
+                version: 2,
+                device_id: "pc-a".into(),
+                name: "A".into(),
+            },
+            target: Some("pc-b".into()),
+            ack: ack_tx,
+        });
+        let ack = tokio::time::timeout(Duration::from_millis(200), ack_rx)
+            .await
+            .expect("explicit-target send must not wait for the writer task")
+            .unwrap();
+        assert!(ack.is_ok());
+    }
+
+    #[tokio::test]
+    async fn attach_inbound_rejects_peer_revoked_after_hello_gate() {
+        // Regression: trust could be revoked after Hello authorization but
+        // before the gated task attached the stream. The runtime must re-check
+        // trust when it serializes the attach command, or the revoked peer
+        // becomes live and can receive clipboard/file data.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        app.trust.revoke("pc-b");
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, connected, active) = test_runtime(state);
+
+        let (client, _server) = tokio::io::duplex(64);
+        let stream = crate::transport::PeerStream::from_test_duplex(client);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::AttachInbound {
+            stream,
+            peer_device_id: "pc-b".into(),
+            ack: ack_tx,
+        });
+
+        assert!(ack_rx.await.unwrap().is_err());
+        assert!(runtime.connections.is_empty());
+        assert!(!connected.load(Ordering::SeqCst));
+        assert!(active.lock().unwrap().is_none());
     }
 
     #[test]

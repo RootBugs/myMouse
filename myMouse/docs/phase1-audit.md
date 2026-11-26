@@ -105,9 +105,9 @@ Commands were run from `myMouse/` unless noted.
 
 | Command | Result |
 | --- | --- |
-| `cargo test --quiet` in `myMouse/backend` | `52 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
-| `cargo test --quiet` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
-| `npm test -- --run` | `4 files / 16 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
+| `cargo test` in `myMouse/backend` | `68 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
+| `cargo test` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
+| `npm test -- --run` | `5 files / 19 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
 | `npm run build` | exit 0; Vite produced `index.html`, CSS, and JS assets; Electron TypeScript build succeeded |
 | `npm run smoke` | `OK: pc-a forwarded one crossing to pc-b over pinned TLS; pc-b received one InputEvent.` |
 | Back-to-back `npm run smoke` | both runs exit 0 after making smoke log paths per-run unique |
@@ -130,8 +130,19 @@ to `git diff --check`, which is clean.
 
 - Persistent device identity and name; dynamic peer target stamping.
 - Full local event model with key down/up, buttons, wheel, and stable key names.
-- Layout crossing math, protocol v2, trust/capability gates, clipboard and file
-  manager bounds, pairing state machine, rate limiting, and hotkey rejection.
+- Layout serde/validation/atomic persistence, `setLayout`/`getLayout` local IPC,
+  topology-driven input bridge, crossing math, protocol v2, trust/capability
+  gates, clipboard and file manager bounds, pairing state machine, rate
+  limiting, and hotkey rejection.
+- Backend-driven React layout view with an explicit empty state.
+- Review-driven hardening (three review rounds): handoff frames are routed to
+  the explicit crossing target instead of the runtime's independent selection;
+  revoking the active peer disconnects it, clears the runtime mirrors and pauses
+  the bridge; a dead forwarding channel no longer suppresses local input; a
+  queued handoff frame to a vanished target is dropped and acked in the runtime
+  so a concurrent disconnect cannot kill the forwarding task; inbound streams
+  re-check trust at attach time so a revoke cannot be bypassed by a handshake
+  that finishes late. Each fix has a red→green regression test.
 
 ### Integration / harness-tested
 
@@ -149,16 +160,21 @@ to `git diff --check`, which is clean.
 
 ### Not implemented / still open
 
-- Production boundary detection and handoff from the live Windows capture hook;
-  `setLayout` is still a no-op in production and the React layout view is static.
+- Physical validation of live boundary detection/handoff from the Windows
+  capture hook on two separate PCs/tablets; handoff is implemented and
+  unit-tested but only the synthetic harness crossing ran here.
 - Per-monitor DPI compensation and robust multi-monitor coordinate mapping.
+- A full drag-and-drop visual topology editor; the current view renders
+  backend-provided state.
 - Replay protection (nonces/timestamps) and stronger per-peer rate limiting.
 - Real multi-peer routing/topology beyond one connected peer.
 - Remote screen streaming; Android APK and macOS builds; code signing.
 - Hardware-level audit of Windows `SendInput` and live TLS downgrade rejection.
+- Return-to-local re-entry when the cursor crosses back from the peer (the
+  emergency stop/Escape path is authoritative today).
 
 ## Next milestone
 
-Wire production topology: persist `setLayout` from the UI, build the runtime
-`Layout` from trusted peers, detect real edge crossings from captured mouse
-moves, and emit one handoff only when a target peer is connected and permitted.
+Validate the implemented topology/handoff path with two physical machines and
+real multi-monitor geometry, then add return-to-local re-entry only after that
+behaviour is verified. Do not claim field readiness before physical testing.
