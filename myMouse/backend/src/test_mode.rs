@@ -12,15 +12,15 @@ use crate::layout::{Edge, Layout, Node, Side};
 use crate::network::{start as start_network, PeerRuntimeHandle};
 use crate::transport::{Client, Server};
 use crate::{
-    apply_clipboard_settings, apply_file_transfer_settings, clipboard_message_from_params,
-    config_dir, AppState,
+    apply_clipboard_settings, apply_file_transfer_settings, clipboard_message_from_params, AppState,
 };
-use crate::trust::Capabilities;
+use crate::trust::{is_valid_id, Capabilities};
 use mymouse_protocol::{Message, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,6 +78,21 @@ pub fn parse_args(args: &[String]) -> Option<TestConfig> {
         peer,
         auto_cross,
     })
+}
+
+/// Test mode must never read or write the production config root. An explicit
+/// harness override is honoured; otherwise state is kept in the OS temp tree,
+/// keyed by the synthetic device ID so two test instances cannot collide.
+pub(crate) fn test_config_dir(device_id: &str) -> PathBuf {
+    if let Ok(dir) = std::env::var("MYMOUSE_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    let name = if is_valid_id(device_id) {
+        device_id
+    } else {
+        "test"
+    };
+    std::env::temp_dir().join("myMouse-test").join(name)
 }
 
 fn hex_decode(value: &str) -> Vec<u8> {
@@ -166,7 +181,7 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
     let device_id = config.device_id.clone();
     let peer_id = config.peer_id.clone();
     let state = Arc::new(Mutex::new(AppState::with_device_id(
-        config_dir(),
+        test_config_dir(&device_id),
         device_id.clone(),
     )?));
     // Test mode has no interactive pairing; grant the statically configured

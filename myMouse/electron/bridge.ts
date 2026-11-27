@@ -118,6 +118,13 @@ export class Bridge {
         continue;
       }
 
+      // Notifications are not RPC replies. `discoveredPeer` legitimately uses
+      // `id` for a string device ID, so classify by `notification` first.
+      if (typeof message.notification === 'string') {
+        this.notify(message);
+        continue;
+      }
+
       const id = message.id;
       if (!('id' in message) || !Number.isInteger(id)) {
         if ('id' in message) {
@@ -129,7 +136,10 @@ export class Bridge {
       }
 
       const result = message.result;
-      if (!('result' in message) || !this.isObject(result)) {
+      // Backend successes are heterogeneous: status objects, device arrays,
+      // and scalar pairing URIs. Only a missing or null result is malformed;
+      // error replies remain object-shaped with `ok: false`.
+      if (!('result' in message) || result === null) {
         this.notifyMalformed(line);
         continue;
       }
@@ -142,8 +152,9 @@ export class Bridge {
       this.pending.delete(id as number);
       this.clearTimer(pending);
 
-      if (message.ok === false || result.ok === false) {
-        const detail = result.error ?? message.error ?? 'IPC request failed';
+      const resultObject = this.isObject(result) ? result : null;
+      if (message.ok === false || resultObject?.ok === false) {
+        const detail = resultObject?.error ?? message.error ?? 'IPC request failed';
         pending.reject(new Error(String(detail)));
       } else {
         pending.resolve(result);

@@ -90,10 +90,14 @@ unit-tested and wired**; both **not physically tested**.
   [benchmarks.md](benchmarks.md). It is a **two-process loopback harness** on
   one Windows host: not field latency, not a physical two-PC session, and not a
   comparison with any upstream product.
-- Measured values on this host: input delivery 8.9 ms, clipboard 15.688
-  Mbit/s, file 15.307 Mbit/s, cold pinned-TLS connect 121.46 ms, idle CPU
-  0/0% on the two processes, idle RAM 12.07/11.81 MiB. Reconnect after peer loss is
-  deliberately `null`/unmeasured because test mode has no auto-reconnect loop.
+- Final measured values on this host (post-remediation harness re-run): input
+  delivery 30.67 ms, clipboard 5.342 Mbit/s, file 4.21 Mbit/s, cold pinned-TLS
+  connect 339.48 ms, idle CPU 0/0% on the two processes, idle RAM
+  12.13/11.9 MiB. Reconnect after peer loss is deliberately `null`/unmeasured
+  because test mode has no auto-reconnect loop. An earlier sample on the same
+  harness reported 8.9 ms / 15.688 Mbit/s / 15.307 Mbit/s / 121.46 ms; the
+  difference is host-load variance, not a product improvement or regression
+  claim. See [benchmarks.md](benchmarks.md).
 - Benchmarking exposed a real production bug: file transfers above one 256 KiB
   chunk stalled after the first chunk. The regression test
   `accept_sends_every_chunk_for_large_file` went red → green, and the 1 MiB
@@ -143,22 +147,29 @@ adversary test was run.**
 - TLS 1.3-only is configured in rustls. No live TLS 1.2 downgrade attempt was
   executed, so this is a configuration-level statement.
 
-## Verification evidence (fresh, 2026-11-27)
+## Verification evidence (2026-11-27, final matrix unless marked earlier)
 
 Commands were run from `myMouse/` unless noted.
 
 | Command | Result |
 | --- | --- |
-| `cargo test` in `myMouse/backend` | `81 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
-| `cargo test` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
-| `npm test -- --run` | `5 files / 19 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
-| `npm run build` | exit 0; Vite produced `index.html`, CSS, and JS assets; Electron TypeScript build succeeded |
-| `npm run smoke` | `OK: pc-a forwarded one crossing to pc-b over pinned TLS; pc-b received one InputEvent.` |
-| `npm run benchmark` | exit 0; wrote two-process loopback values to `docs/benchmarks.md`, reconnect unmeasured |
-| `git diff --check` | exit 0; only pre-existing LF→CRLF normalization warnings |
-| Back-to-back `npm run smoke` | both runs exit 0 after making smoke log paths per-run unique |
-| `npm run dist` | exit 0; unsigned NSIS installer and `win-unpacked` output built |
-| `powershell -NoProfile -ExecutionPolicy Bypass -File installer\verify.ps1` | `OK: unsigned Windows desktop, release backend, and packaged backend resource are present.` |
+| `cargo test --manifest-path backend/Cargo.toml` | exit 0; `115 passed; 0 failed` unit tests; `1 passed; 0 failed` in each of three integration binaries (`clipboard_file_two_instance`, `test_mode_config`, `two_instance`) |
+| `cargo test --manifest-path shared/protocol/Cargo.toml` | exit 0; `11 passed; 0 failed` |
+| `npm run test:ci` | exit 0; `6 files / 26 tests passed` |
+| `npm run build` | exit 0; Vite production build and Electron TypeScript build succeeded |
+| `npm run smoke` | exit 0; `OK: pc-a forwarded one crossing to pc-b over pinned TLS; pc-b received one InputEvent.` |
+| `npm run benchmark` | exit 0; wrote the final two-process loopback sample to `docs/benchmarks.md`; reconnect remains `null`/unmeasured |
+| `git diff --check` (repo root) | exit 0; only pre-existing LF→CRLF normalization warnings |
+| Back-to-back `npm run smoke` (earlier phase) | both runs exit 0 after making smoke log paths per-run unique |
+| `npm run dist` (earlier phase) | exit 0; unsigned NSIS installer and `win-unpacked` output built |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File installer\verify.ps1` (earlier phase) | `OK: unsigned Windows desktop, release backend, and packaged backend resource are present.` |
+
+The final counts above include the fresh whole-branch review fixes R1–R8: every
+fix had a watched RED test and a focused GREEN rerun before the full matrix. The
+benchmark row is the pre-review two-process loopback sample; it was not rerun
+because the script overwrites `docs/benchmarks.md`, and reconnect remains
+`null`/unmeasured. No physical, field, Android, macOS or signed-release claim
+follows from these counts.
 
 The smoke harness originally reused fixed log paths. A rapid rerun could fail
 while PowerShell's asynchronous redirected stdout handle from the previous run
@@ -169,6 +180,39 @@ each run a unique log directory; two consecutive runs now pass.
 Rust files touched here. Only the new `backend/src/device.rs` was formatted; a
 repo-wide reformat would add unrelated churn, so formatting hygiene was limited
 to `git diff --check`, which is clean.
+
+## Production-grade remediation (final, 2026-11-27)
+
+Status: **implemented, unit-tested, integration/harness-tested and Node-level
+tested; not physically tested.** The full per-finding evidence table, commit
+chain, deferred minors, blocked platform work and release caveats are in
+[the production-grade remediation audit](superpowers/audits/2026-11-27-production-grade-remediation.md).
+
+- One protocol (`shared/protocol` v2) and one pinned mutual-TLS transport are
+  unchanged. No second protocol, transport, or mock-only success path exists.
+- Electron IPC lifecycle, file capability/ownership gates, per-peer transfer
+  cleanup, connection-generation-bound routing, protocol parity, pairing
+  session binding, watchdog ownership, monitor-index resolution, clipboard
+  allocation bounds and test-mode config isolation each have a watched RED
+  test, a minimal fix and a GREEN rerun.
+- `backend/tests/test_mode_config.rs` is an integration/harness test proving
+  that `--test-mode` never writes the production config root, with and without
+  an explicit `MYMOUSE_CONFIG_DIR` override.
+- A fresh whole-branch review found four Important and four Minor issues after
+  those commits; all were fixed at source with watched RED tests: scalar IPC
+  results and string-ID notifications are no longer dropped; non-handoff sends
+  propagate failures and failed offers become terminal; accept/reject route to
+  the offering peer; active-peer refresh fails closed; outbound frames obey the
+  1 MiB cap; sender-side cancel works on incoming transfers; and duplicate-chunk
+  replay tolerates short reads. Final re-grade and exact evidence are in the
+  remediation audit.
+- Security defaults remain mutual TLS, fingerprint pinning, explicit approval,
+  capability permissions and revocable trust. Discovery never grants trust.
+- Autostart remains off; Windows builds remain unsigned because no signing
+  certificate was supplied. macOS notarization is unavailable on this host.
+- Android first-time pairing/client-certificate provisioning and the macOS
+  companion remain **source-only/unverified**; there is no physical two-PC,
+  mDNS, Wi-Fi, multi-monitor/DPI or hardware `SendInput` evidence.
 
 ## Status inventory
 
@@ -183,7 +227,8 @@ to `git diff --check`, which is clean.
 - Backend-driven React layout view with an explicit empty state.
 - Multi-chunk file-transfer regression test, injected-input tracker, liveness
   timeout boundary, one-shot watchdog latch, and Status heartbeat dispatch.
-- Review-driven hardening (three review rounds): handoff frames are routed to
+- Review-driven hardening (four review rounds, ending with the final whole-branch
+  review R1–R8): handoff frames are routed to
   the explicit crossing target instead of the runtime's independent selection;
   revoking the active peer disconnects it, clears the runtime mirrors and pauses
   the bridge; a dead forwarding channel no longer suppresses local input; a
@@ -191,6 +236,22 @@ to `git diff --check`, which is clean.
   so a concurrent disconnect cannot kill the forwarding task; inbound streams
   re-check trust at attach time so a revoke cannot be bypassed by a handshake
   that finishes late. Each fix has a red→green regression test.
+- Final hardening: Electron IPC exit/timeout/malformed-reply rejection; strict
+  `result` object validation; file control messages gated by `files` capability
+  and transfer ownership; per-peer disconnect cleanup and duplicate-chunk
+  idempotence; connection-generation-bound `Hello` and active-peer-only default
+  routing; protocol full-body consumption, signed-range parity and 1 MiB frame
+  cap; pairing code bound to an approved session's authenticated peer and
+  certificate fingerprint; watchdog release ownership; topology-derived local
+  monitor index; `GlobalSize`-bounded UTF-16 scan; test-mode config resolver.
+- Final whole-branch review hardening, each with a watched RED test: scalar and
+  object IPC results are accepted while errors stay object-shaped; discovery
+  notifications are classified before reply-ID validation; only handoff frames
+  use a best-effort ack while other targeted sends propagate failure; failed
+  offers become `Failed` in history; accept/reject use the transfer's peer;
+  active-peer refresh clears a vanished target instead of guessing; `write_frame`
+  enforces the 1 MiB cap; cancel is valid for either transfer ownership; replay
+  comparison uses `read_exact` behind a reader seam.
 
 ### Integration / harness-tested
 
@@ -200,6 +261,8 @@ to `git diff --check`, which is clean.
 - The two-process benchmark measures input, clipboard/file throughput, cold
   connect and idle resources; it completes a 1 MiB multi-chunk transfer.
 - Frontend React tests and Electron bridge tests.
+- A spawned test-mode backend with a simulated production `APPDATA` cannot read
+  or write that production config root, with or without `MYMOUSE_CONFIG_DIR`.
 - Windows packaging and artifact presence.
 
 ### Physically tested

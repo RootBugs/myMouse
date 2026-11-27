@@ -312,6 +312,15 @@ pub struct PeerStream {
 
 async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, message: &Message) -> TransportResult<()> {
     let payload = mymouse_protocol::encode(message);
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded frame is {} bytes, above the {MAX_FRAME_LEN} byte cap",
+                payload.len()
+            ),
+        )));
+    }
     let length = payload.len() as u32;
     stream.write_all(&length.to_be_bytes()).await?;
     stream.write_all(&payload).await?;
@@ -500,5 +509,22 @@ mod tests {
             Message::Hello { device_id, .. } => assert_eq!(device_id, "pc-b"),
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_outbound_frame_is_rejected_before_write() {
+        // Regression: read_frame enforced MAX_FRAME_LEN but write_frame did
+        // not, so an internal oversized message was written and then rejected
+        // by the remote peer instead of failing locally.
+        let message = Message::InputEvent {
+            target: "pc-b".into(),
+            payload: vec![0u8; MAX_FRAME_LEN],
+        };
+        let result = write_frame(&mut tokio::io::sink(), &message).await;
+
+        assert!(
+            result.is_err(),
+            "an encoded frame above the 1 MiB cap must fail before it is written"
+        );
     }
 }

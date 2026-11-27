@@ -690,15 +690,26 @@ async fn handle_request(
         }
         "acceptTransfer" => {
             let transfer_id = params.get("transferId").and_then(Value::as_str).unwrap_or("");
-            let messages = {
+            let (peer, messages) = {
                 let mut st = state.lock().unwrap();
-                st.transfers.accept(transfer_id)
+                let peer = st
+                    .transfers
+                    .history()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.transfer_id == transfer_id)
+                    .map(|entry| entry.peer_device_id.clone());
+                let messages = st.transfers.accept(transfer_id);
+                (peer, messages)
+            };
+            let Some(peer) = peer else {
+                return rpc_err(id, "unknown transfer");
             };
             match messages {
                 Ok(messages) => {
                     let count = messages.len();
                     for message in messages {
-                        if let Err(error) = network.send(message).await {
+                        if let Err(error) = network.send_to(message, Some(peer.clone())).await {
                             return rpc_err(id, &error);
                         }
                     }
@@ -710,12 +721,23 @@ async fn handle_request(
         "rejectTransfer" => {
             let transfer_id = params.get("transferId").and_then(Value::as_str).unwrap_or("");
             let reason = params.get("reason").and_then(Value::as_str).map(|s| s.to_string());
-            let messages = {
+            let (peer, messages) = {
                 let mut st = state.lock().unwrap();
-                st.transfers.reject(transfer_id, reason)
+                let peer = st
+                    .transfers
+                    .history()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.transfer_id == transfer_id)
+                    .map(|entry| entry.peer_device_id.clone());
+                let messages = st.transfers.reject(transfer_id, reason);
+                (peer, messages)
+            };
+            let Some(peer) = peer else {
+                return rpc_err(id, "unknown transfer");
             };
             for message in messages {
-                if let Err(error) = network.send(message).await {
+                if let Err(error) = network.send_to(message, Some(peer.clone())).await {
                     return rpc_err(id, &error);
                 }
             }
@@ -747,6 +769,13 @@ async fn handle_request(
                         .send_to(Message::FileTransferOffer(offer.clone()), Some(peer.clone()))
                         .await
                     {
+                        {
+                            let mut st = state.lock().unwrap();
+                            st.transfers.mark_failed(
+                                &offer.transfer_id,
+                                &format!("offer could not be sent: {error}"),
+                            );
+                        }
                         return rpc_err(id, &error);
                     }
                     rpc_ok(id, json!({ "ok": true, "offer": offer }));
@@ -1242,6 +1271,209 @@ mod tests {
             !matches!(leaked, Ok(Some(_))),
             "the offer must not leak to the outbound peer that was not selected"
         );
+
+        shutdown_runtime(&network, || {});
+    }
+
+    #[tokio::test]
+    async fn offer_file_marks_history_failed_when_targeted_send_fails() {
+        // Regression: a stale active peer made offerFile acknowledge an offer
+        // that was never written, and history kept it in Offered forever.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("stale.bin");
+        std::fs::write(&source, vec![3u8; 16]).unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(dir.path().to_path_buf()).unwrap()));
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+        *network.active_peer_id().lock().unwrap() = Some("pc-b".to_string());
+
+        handle_request(
+            &state,
+            &network,
+            1,
+            &json!({
+                "method": "offerFile",
+                "params": { "path": source.to_string_lossy() }
+            }),
+        )
+        .await;
+
+        let record = {
+            let st = state.lock().unwrap();
+            st.transfers
+                .history()
+                .iter()
+                .find(|entry| entry.name == "stale.bin")
+                .cloned()
+                .expect("a failed offer must still leave an auditable record")
+        };
+        assert_eq!(
+            record.state,
+            crate::file_transfer::TransferState::Failed,
+            "an offer whose frame was dropped must not remain Offered"
+        );
+
+        shutdown_runtime(&network, || {});
+    }
+
+    #[tokio::test]
+    async fn accept_transfer_targets_the_offering_peer_not_the_active_peer() {
+        // Regression: acceptTransfer used the default active-peer route, so a
+        // user accepting an inbound pc-c offer while pc-b was active sent the
+        // verdict to pc-b, whose ownership gate rejected it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-c", Capabilities::default());
+        app.settings.file_transfer.save_dir = dir.path().join("downloads").to_string_lossy().to_string();
+        app.transfers.set_settings(app.settings.file_transfer.clone());
+        let transfer_id = "incoming-from-c-accept";
+        app.transfers.handle_offer(
+            mymouse_protocol::FileOffer {
+                transfer_id: transfer_id.into(),
+                from_device_id: "pc-c".into(),
+                name: "c.txt".into(),
+                size: 4,
+                sha256: "x".into(),
+                mime: None,
+            },
+            "pc-c",
+        );
+        let state = Arc::new(Mutex::new(app));
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let (out_client, _out_server) = tokio::io::duplex(4096);
+        network
+            .attach_outbound(
+                crate::transport::PeerStream::from_test_duplex(out_client),
+                "pc-b".into(),
+            )
+            .await
+            .unwrap();
+        let (in_client, in_server) = tokio::io::duplex(4096);
+        network
+            .attach_inbound(
+                crate::transport::PeerStream::from_test_duplex(in_client),
+                "pc-c".into(),
+            )
+            .await
+            .unwrap();
+        *network.active_peer_id().lock().unwrap() = Some("pc-b".into());
+
+        handle_request(
+            &state,
+            &network,
+            1,
+            &json!({
+                "method": "acceptTransfer",
+                "params": { "transferId": transfer_id }
+            }),
+        )
+        .await;
+
+        let mut offering_peer = crate::transport::PeerStream::from_test_duplex(in_server);
+        let accepted = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match offering_peer.recv().await {
+                    Ok(Message::FileTransferAccept { transfer_id }) => break transfer_id,
+                    Ok(_) => continue,
+                    Err(error) => panic!("the offering peer's frame must decode: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the accept verdict must reach the peer that offered the file");
+        assert_eq!(accepted, transfer_id);
+
+        shutdown_runtime(&network, || {});
+    }
+
+    #[tokio::test]
+    async fn reject_transfer_targets_the_offering_peer_not_the_active_peer() {
+        // Regression: rejectTransfer had the same active-peer default route as
+        // acceptTransfer, leaving the real offering peer waiting and its
+        // transfer record stuck.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-c", Capabilities::default());
+        app.settings.file_transfer.save_dir = dir.path().join("downloads").to_string_lossy().to_string();
+        app.transfers.set_settings(app.settings.file_transfer.clone());
+        let transfer_id = "incoming-from-c-reject";
+        app.transfers.handle_offer(
+            mymouse_protocol::FileOffer {
+                transfer_id: transfer_id.into(),
+                from_device_id: "pc-c".into(),
+                name: "c.txt".into(),
+                size: 4,
+                sha256: "x".into(),
+                mime: None,
+            },
+            "pc-c",
+        );
+        let state = Arc::new(Mutex::new(app));
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let (out_client, _out_server) = tokio::io::duplex(4096);
+        network
+            .attach_outbound(
+                crate::transport::PeerStream::from_test_duplex(out_client),
+                "pc-b".into(),
+            )
+            .await
+            .unwrap();
+        let (in_client, in_server) = tokio::io::duplex(4096);
+        network
+            .attach_inbound(
+                crate::transport::PeerStream::from_test_duplex(in_client),
+                "pc-c".into(),
+            )
+            .await
+            .unwrap();
+        *network.active_peer_id().lock().unwrap() = Some("pc-b".into());
+
+        handle_request(
+            &state,
+            &network,
+            1,
+            &json!({
+                "method": "rejectTransfer",
+                "params": { "transferId": transfer_id, "reason": "no" }
+            }),
+        )
+        .await;
+
+        let mut offering_peer = crate::transport::PeerStream::from_test_duplex(in_server);
+        let rejected = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match offering_peer.recv().await {
+                    Ok(Message::FileTransferReject { transfer_id, .. }) => break transfer_id,
+                    Ok(_) => continue,
+                    Err(error) => panic!("the offering peer's frame must decode: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the reject verdict must reach the peer that offered the file");
+        assert_eq!(rejected, transfer_id);
 
         shutdown_runtime(&network, || {});
     }

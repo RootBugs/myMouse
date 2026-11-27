@@ -157,6 +157,20 @@ pub struct FileTransferManager {
     history: Vec<TransferRecord>,
 }
 
+/// Compare a replayed chunk with the bytes already persisted in the `.part`
+/// file. The reader is a parameter so short-read behaviour is deterministic in
+/// tests; the caller has already sought to `chunk.offset`.
+fn replayed_chunk_matches<R: Read>(reader: &mut R, expected: &[u8]) -> std::io::Result<bool> {
+    let mut existing = vec![0u8; expected.len()];
+    match reader.read_exact(&mut existing) {
+        Ok(()) => Ok(existing == expected),
+        // A genuine EOF means fewer stored bytes than the replay claims; that
+        // is a conflict, but a one-byte-at-a-time reader is not.
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 impl FileTransferManager {
     pub fn new(device_id: impl Into<String>, settings: FileTransferSettings) -> Self {
         Self {
@@ -504,10 +518,8 @@ impl FileTransferManager {
             // match exactly; conflicting bytes indicate a corrupted or hostile
             // sender and must fail the transfer instead of being silently kept.
             let mut existing_file = File::open(&part_path)?;
-            let mut existing = vec![0u8; chunk.data.len()];
             existing_file.seek(SeekFrom::Start(chunk.offset))?;
-            let read = existing_file.read(&mut existing)?;
-            if read != chunk.data.len() || existing != chunk.data {
+            if !replayed_chunk_matches(&mut existing_file, &chunk.data)? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "chunk conflicts with already written bytes",
@@ -1192,5 +1204,41 @@ mod tests {
             last: false,
         };
         assert!(mgr.handle_chunk(conflicting).is_err());
+    }
+
+    /// A `Read` implementation that legally returns one byte per call, like a
+    /// pipe or a partially available network-backed reader.
+    struct OneByteReader {
+        bytes: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for OneByteReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() || self.pos >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn duplicate_chunk_replay_tolerates_short_reads() {
+        let mut identical = OneByteReader { bytes: vec![1, 2, 3, 4], pos: 0 };
+        assert!(
+            replayed_chunk_matches(&mut identical, &[1, 2, 3, 4]).unwrap(),
+            "a legal short read of matching bytes must not be treated as a conflict"
+        );
+
+        let mut conflicting = OneByteReader { bytes: vec![1, 2, 9, 4], pos: 0 };
+        assert!(!replayed_chunk_matches(&mut conflicting, &[1, 2, 3, 4]).unwrap());
+
+        let mut truncated = OneByteReader { bytes: vec![1, 2], pos: 0 };
+        assert!(
+            !replayed_chunk_matches(&mut truncated, &[1, 2, 3, 4]).unwrap(),
+            "genuinely truncated stored bytes must still be a conflict"
+        );
     }
 }

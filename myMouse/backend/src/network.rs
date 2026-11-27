@@ -66,14 +66,19 @@ fn message_allowed_by_capabilities(capabilities: Option<&Capabilities>, message:
 enum TransferOwnership {
     Outgoing,
     Incoming,
+    /// Either side may end a transfer: the sender cancels its offer while the
+    /// receiver may cancel an accepted transfer before completion.
+    Either,
 }
 
 fn transfer_message_target(message: &Message) -> Option<(&str, TransferOwnership)> {
     match message {
         Message::FileTransferAccept { transfer_id }
-        | Message::FileTransferReject { transfer_id, .. }
-        | Message::FileTransferCancel { transfer_id, .. } => {
+        | Message::FileTransferReject { transfer_id, .. } => {
             Some((transfer_id, TransferOwnership::Outgoing))
+        }
+        Message::FileTransferCancel { transfer_id, .. } => {
+            Some((transfer_id, TransferOwnership::Either))
         }
         Message::FileTransferChunk(chunk) => Some((&chunk.transfer_id, TransferOwnership::Incoming)),
         Message::FileTransferComplete { transfer_id } => {
@@ -103,6 +108,10 @@ fn message_allowed_by_ownership(
         }
         Some((transfer_id, TransferOwnership::Incoming)) => {
             state.transfers.owns_incoming(transfer_id, peer_device_id)
+        }
+        Some((transfer_id, TransferOwnership::Either)) => {
+            state.transfers.owns_outgoing(transfer_id, peer_device_id)
+                || state.transfers.owns_incoming(transfer_id, peer_device_id)
         }
     }
 }
@@ -598,18 +607,18 @@ impl PeerRuntime {
                 ack,
             } => {
                 let targeted = target.is_some();
+                // Only cursor handoff is best-effort: a revoked target must not
+                // kill the single forwarding task. File, clipboard and setup
+                // frames still need a real write result so callers never report
+                // success for a frame that was never queued or written.
+                let best_effort_handoff = matches!(message, Message::InputEvent { .. });
                 // Default sends follow the one active peer chosen by the
                 // runtime; they never fall through to arbitrary connections.
                 let effective = target.or_else(|| {
                     self.active_peer_id.lock().unwrap().clone()
                 });
                 let Some(key) = select_send_key(&self.connections, effective.as_deref()) else {
-                    // A handoff frame addressed to a peer that was revoked or
-                    // disconnected while it was queued is a dropped frame, not
-                    // a fatal transport error. Breaking the single forwarding
-                    // task here would strand every later crossing with no
-                    // consumer until the app restarted.
-                    let result = if targeted {
+                    let result = if targeted && best_effort_handoff {
                         Ok(())
                     } else {
                         Err("no peer connected".into())
@@ -622,17 +631,17 @@ impl PeerRuntime {
                 // data to peers that did not request it. An explicit target
                 // keeps handoff frames from crossing peer connections.
                 if let Some(connection) = self.connections.get(&key) {
-                    // Handoff frames are best-effort. Resolve their ack here
-                    // instead of in the writer task so a concurrent disconnect
-                    // cannot drop the ack and permanently kill the forwarding
-                    // task. Other messages still wait for the framed write.
-                    let ack = if targeted {
+                    let ack = if best_effort_handoff {
                         let _ = ack.send(Ok(()));
                         None
                     } else {
                         Some(ack)
                     };
-                    let _ = connection.tx.send(OutgoingFrame { message, ack });
+                    if let Err(error) = connection.tx.send(OutgoingFrame { message, ack }) {
+                        if let Some(ack) = error.0.ack {
+                            let _ = ack.send(Err("peer writer stopped".into()));
+                        }
+                    }
                 } else {
                     let _ = ack.send(Err("no peer connected".into()));
                 }
@@ -844,10 +853,20 @@ impl PeerRuntime {
             *self.active_peer_id.lock().unwrap() = None;
         } else {
             self.peer_connected.store(true, Ordering::SeqCst);
+            let selected = { self.active_peer_id.lock().unwrap().clone() };
+            // Never guess from HashMap order. Keep the previously selected peer
+            // only if it is still live; otherwise default sends fail closed
+            // until a peer is explicitly selected again.
             let next = self
                 .connections
                 .get(&PeerKey::Outbound)
-                .or_else(|| self.connections.values().next())
+                .or_else(|| {
+                    selected.as_deref().and_then(|peer_id| {
+                        self.connections
+                            .values()
+                            .find(|connection| connection.peer_device_id == peer_id)
+                    })
+                })
                 .map(|connection| connection.peer_device_id.clone());
             *self.active_peer_id.lock().unwrap() = next;
         }
@@ -1419,6 +1438,44 @@ mod tests {
         connections.insert(PeerKey::Accepted(2), connection("pc-c"));
 
         assert_eq!(select_send_key(&connections, None), None);
+    }
+
+    #[test]
+    fn refresh_active_peer_never_guesses_among_accepted_peers() {
+        // Regression: after the selected inbound peer disappeared, an
+        // arbitrary HashMap entry became the active target and silently
+        // redirected clipboard/file sends to a different trusted peer.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, connected, active) = test_runtime(state);
+        for (key, peer) in [(PeerKey::Accepted(1), "pc-b"), (PeerKey::Accepted(2), "pc-c")] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            runtime.connections.insert(
+                key,
+                Connection {
+                    tx,
+                    tasks: Vec::new(),
+                    generation: 1,
+                    peer_device_id: peer.into(),
+                },
+            );
+        }
+        *active.lock().unwrap() = Some("pc-c".into());
+        runtime.connections.remove(&PeerKey::Accepted(2));
+
+        runtime.refresh_active_peer();
+
+        assert!(
+            connected.load(Ordering::SeqCst),
+            "another live peer still keeps the runtime connected"
+        );
+        assert_eq!(
+            *active.lock().unwrap(),
+            None,
+            "a missing selected peer must not be replaced by an arbitrary accepted peer"
+        );
     }
 
     #[tokio::test]
@@ -2239,10 +2296,9 @@ mod tests {
         let (mut runtime, _connected, _active) = test_runtime(state);
         let (ack_tx, ack_rx) = oneshot::channel();
         runtime.handle_command(RuntimeCommand::Send {
-            message: Message::Hello {
-                version: 2,
-                device_id: "pc-a".into(),
-                name: "A".into(),
+            message: Message::InputEvent {
+                target: "pc-b".into(),
+                payload: Vec::new(),
             },
             target: Some("revoked-peer".into()),
             ack: ack_tx,
@@ -2272,10 +2328,9 @@ mod tests {
         );
         let (ack_tx, ack_rx) = oneshot::channel();
         runtime.handle_command(RuntimeCommand::Send {
-            message: Message::Hello {
-                version: 2,
-                device_id: "pc-a".into(),
-                name: "A".into(),
+            message: Message::InputEvent {
+                target: "pc-b".into(),
+                payload: Vec::new(),
             },
             target: Some("pc-b".into()),
             ack: ack_tx,
@@ -2285,6 +2340,51 @@ mod tests {
             .expect("explicit-target send must not wait for the writer task")
             .unwrap();
         assert!(ack.is_ok());
+    }
+
+    #[tokio::test]
+    async fn targeted_non_handoff_send_reports_a_dead_writer() {
+        // Regression: all targeted sends acked Ok(()) before queueing so a
+        // handoff could not hang. That also made file offers report success
+        // when the peer's writer had already exited.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        runtime.connections.insert(
+            PeerKey::Accepted(1),
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::Send {
+            message: Message::FileTransferOffer(mymouse_protocol::FileOffer {
+                transfer_id: "t1".into(),
+                from_device_id: "pc-a".into(),
+                name: "a.txt".into(),
+                size: 1,
+                sha256: "x".into(),
+                mime: None,
+            }),
+            target: Some("pc-b".into()),
+            ack: ack_tx,
+        });
+        let ack = tokio::time::timeout(Duration::from_millis(200), ack_rx)
+            .await
+            .expect("a non-handoff send must not hang when its writer is gone")
+            .expect("ack channel must stay open");
+
+        assert!(
+            ack.is_err(),
+            "a file offer with a dead writer must not be reported as sent"
+        );
     }
 
     #[tokio::test]
@@ -2484,5 +2584,57 @@ mod tests {
             .expect("the offer history record must survive");
         assert_eq!(record.peer_device_id, "pc-c");
         assert_eq!(record.state, crate::file_transfer::TransferState::Offered);
+    }
+
+    #[test]
+    fn sender_can_cancel_an_incoming_transfer() {
+        // Regression: Cancel was hard-coded to outgoing ownership, so a sender
+        // could not cancel an offer the receiver had already accepted. The
+        // manager supports both directions; only the inbound gate was wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        app.transfers.handle_offer(
+            mymouse_protocol::FileOffer {
+                transfer_id: "incoming-cancel".into(),
+                from_device_id: "pc-b".into(),
+                name: "a.txt".into(),
+                size: 4,
+                sha256: "x".into(),
+                mime: None,
+            },
+            "pc-b",
+        );
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Accepted(1),
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+            peer_fingerprint: None,
+            message: Message::FileTransferCancel {
+                transfer_id: "incoming-cancel".into(),
+                reason: Some("changed mind".into()),
+            },
+        });
+
+        let record = {
+            let state = runtime.state.lock().unwrap();
+            state
+                .transfers
+                .history()
+                .iter()
+                .rev()
+                .find(|entry| entry.transfer_id == "incoming-cancel")
+                .cloned()
+                .expect("the incoming transfer must remain in history")
+        };
+        assert_eq!(
+            record.state,
+            crate::file_transfer::TransferState::Cancelled,
+            "the offering peer must be able to cancel its own incoming transfer"
+        );
+        assert_eq!(record.message.as_deref(), Some("changed mind"));
     }
 }

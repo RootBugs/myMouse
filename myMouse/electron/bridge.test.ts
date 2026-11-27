@@ -35,6 +35,36 @@ describe('Bridge', () => {
     await expect(bridge.send('status')).resolves.toMatchObject({ ok: true });
   });
 
+  it('resolves a scalar pairing URI result from the real backend shape', async () => {
+    const backend = makeMockBackend();
+    backend.stdin.write = () => true;
+    const bridge = new Bridge(backend, { timeoutMs: 50 });
+    const uri = 'mymouse://pair?code=123456&id=pc-a';
+    const pending = bridge.send('pairingUri', { peerId: 'pc-a', fingerprint: 'abc' });
+    backend.emitLine(JSON.stringify({ id: 1, result: uri }));
+
+    await expect(pending).resolves.toBe(uri);
+  });
+
+  it('delivers a discoveredPeer notification with a string device id', () => {
+    const backend = makeMockBackend();
+    const bridge = new Bridge(backend);
+    const notifications: unknown[] = [];
+    bridge.onNotification((message) => notifications.push(message));
+
+    const discovered = {
+      notification: 'discoveredPeer',
+      id: 'pc-b',
+      name: 'PC B',
+      address: '127.0.0.1',
+      port: 8443,
+      fingerprint: 'abc123',
+    };
+    backend.emitLine(JSON.stringify(discovered));
+
+    expect(notifications).toEqual([discovered]);
+  });
+
   it('rejects pending sends when the backend exits', async () => {
     const backend = makeMockBackend();
     const bridge = new Bridge(backend);
