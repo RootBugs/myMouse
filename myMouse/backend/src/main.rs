@@ -359,10 +359,13 @@ async fn handle_request(
                 .connect(socket_addr, fingerprint.clone(), peer_id.to_string())
                 .await
             {
-                Ok(()) => {
+                Ok(ticket) => {
                     // The remote listener is gated: it will not dispatch any
-                    // application data until it sees our trusted Hello.
-                    if let Err(error) = network.send(hello_message(state)).await {
+                    // application data until it sees our trusted Hello. The
+                    // ticket binds that Hello to this exact connection.
+                    if let Err(error) =
+                        network.send_to_connection(hello_message(state), ticket).await
+                    {
                         return rpc_err(id, &format!("peer rejected handshake: {error}"));
                     }
                     {
@@ -415,10 +418,13 @@ async fn handle_request(
             };
             let pinned = fingerprint.to_ascii_lowercase();
             match network.connect(address, pinned.clone(), peer_id.clone()).await {
-                Ok(()) => {
+                Ok(ticket) => {
                     // Pinning authenticates the TLS peer; the Hello carries our
-                    // device identity through the remote trust gate.
-                    if let Err(error) = network.send(hello_message(state)).await {
+                    // device identity through the remote trust gate and is bound
+                    // to the connection that this RPC just created.
+                    if let Err(error) =
+                        network.send_to_connection(hello_message(state), ticket).await
+                    {
                         return rpc_err(id, &format!("peer rejected handshake: {error}"));
                     }
                     {
@@ -700,7 +706,13 @@ async fn handle_request(
             };
             match offer {
                 Ok(offer) => {
-                    if let Err(error) = network.send(Message::FileTransferOffer(offer.clone())).await {
+                    // The record's peer and the frame destination must come
+                    // from the same resolved value or the accept-side gate
+                    // rejects every UI file transfer.
+                    if let Err(error) = network
+                        .send_to(Message::FileTransferOffer(offer.clone()), Some(peer.clone()))
+                        .await
+                    {
                         return rpc_err(id, &error);
                     }
                     rpc_ok(id, json!({ "ok": true, "offer": offer }));
@@ -1098,6 +1110,101 @@ mod tests {
         assert_eq!(
             record.peer_device_id, "pc-b",
             "a UI offer without a peer id must target the connected peer, not a placeholder"
+        );
+
+        shutdown_runtime(&network, || {});
+    }
+
+    #[tokio::test]
+    async fn production_offer_file_sends_to_recorded_peer() {
+        // Regression: offerFile recorded the active peer ID but sent the frame
+        // through the legacy outbound-first path, so accept-side ownership
+        // checks rejected every UI file transfer when both peers were attached.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("offer.bin");
+        std::fs::write(&source, vec![1u8; 32]).unwrap();
+
+        let mut app = AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-c", Capabilities::default());
+        let state = Arc::new(Mutex::new(app));
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let (out_client, out_server) = tokio::io::duplex(4096);
+        network
+            .attach_outbound(
+                crate::transport::PeerStream::from_test_duplex(out_client),
+                "pc-b".into(),
+            )
+            .await
+            .unwrap();
+        let (in_client, in_server) = tokio::io::duplex(4096);
+        network
+            .attach_inbound(
+                crate::transport::PeerStream::from_test_duplex(in_client),
+                "pc-c".into(),
+            )
+            .await
+            .unwrap();
+        *network.active_peer_id().lock().unwrap() = Some("pc-c".into());
+
+        handle_request(
+            &state,
+            &network,
+            1,
+            &json!({
+                "method": "offerFile",
+                "params": { "path": source.to_string_lossy() }
+            }),
+        )
+        .await;
+
+        let expected_id = {
+            let st = state.lock().unwrap();
+            st.transfers
+                .history()
+                .iter()
+                .find(|entry| entry.name == "offer.bin")
+                .unwrap()
+                .transfer_id
+                .clone()
+        };
+        let mut active_peer = crate::transport::PeerStream::from_test_duplex(in_server);
+        let offer = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match active_peer.recv().await {
+                    Ok(Message::FileTransferOffer(offer)) => break offer,
+                    // Heartbeats may precede the offer; they are not the frame
+                    // under test.
+                    Ok(_) => continue,
+                    Err(error) => panic!("the active peer's frame must decode: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the offer must reach the recorded active peer");
+        assert_eq!(offer.transfer_id, expected_id);
+
+        let mut other_peer = crate::transport::PeerStream::from_test_duplex(out_server);
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                match other_peer.recv().await {
+                    Ok(Message::FileTransferOffer(offer)) => break Some(offer),
+                    Ok(_) => continue,
+                    Err(_) => break None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            !matches!(leaked, Ok(Some(_))),
+            "the offer must not leak to the outbound peer that was not selected"
         );
 
         shutdown_runtime(&network, || {});

@@ -183,8 +183,8 @@ Expected: all tests pass.
 
 - [ ] **Step 2: Run focused red tests**
 
-Run: `cargo test --manifest-path backend/Cargo.toml hello_is_bound_to_its_connection_generation -- --exact`
-Expected: FAIL.
+Run: `cargo test --manifest-path backend/Cargo.toml network::tests::hello_is_bound_to_its_connection_generation -- --exact`
+Expected: FAIL (`--exact` needs the fully qualified Rust test path).
 
 - [ ] **Step 3: Implement routing fixes**
 

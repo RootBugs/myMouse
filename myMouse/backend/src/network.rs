@@ -158,6 +158,14 @@ struct Connection {
     peer_device_id: String,
 }
 
+/// Identity of one exact connection instance. Setup frames such as `Hello`
+/// must carry this ticket so a replaced connection cannot receive them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionTicket {
+    pub peer_device_id: String,
+    pub generation: u64,
+}
+
 enum RuntimeCommand {
     Send {
         message: Message,
@@ -173,7 +181,12 @@ enum RuntimeCommand {
     AttachOutbound {
         stream: PeerStream,
         peer_device_id: String,
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<ConnectionTicket>,
+    },
+    SendToConnection {
+        message: Message,
+        ticket: ConnectionTicket,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     AttachInbound {
         stream: PeerStream,
@@ -270,6 +283,27 @@ impl PeerRuntimeHandle {
             .map_err(|_| "network runtime stopped".to_string())?
     }
 
+    /// Queue a setup frame for one exact connection instance. Unlike a
+    /// device-ID target, the ticket also carries the connection generation, so
+    /// a replaced peer cannot receive a frame intended for its predecessor.
+    pub async fn send_to_connection(
+        &self,
+        message: Message,
+        ticket: ConnectionTicket,
+    ) -> Result<(), String> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::SendToConnection {
+                message,
+                ticket,
+                ack: ack_tx,
+            })
+            .map_err(|_| "network runtime stopped".to_string())?;
+        ack_rx
+            .await
+            .map_err(|_| "network runtime stopped".to_string())?
+    }
+
     /// Drop every connection owned by a peer and clear the active handoff
     /// target. Used when trust is revoked for the currently connected peer.
     pub async fn disconnect_peer(&self, peer_device_id: &str) {
@@ -299,6 +333,16 @@ impl PeerRuntimeHandle {
         stream: PeerStream,
         peer_device_id: String,
     ) -> Result<(), String> {
+        self.attach_outbound_ticket(stream, peer_device_id)
+            .await
+            .map(|_| ())
+    }
+
+    async fn attach_outbound_ticket(
+        &self,
+        stream: PeerStream,
+        peer_device_id: String,
+    ) -> Result<ConnectionTicket, String> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::AttachOutbound {
@@ -337,7 +381,7 @@ impl PeerRuntimeHandle {
         address: SocketAddr,
         fingerprint: String,
         peer_device_id: String,
-    ) -> Result<(), String> {
+    ) -> Result<ConnectionTicket, String> {
         let identity = self
             .identity
             .lock()
@@ -347,7 +391,7 @@ impl PeerRuntimeHandle {
         let stream = Client::connect_with_identity(address, &[fingerprint], identity)
             .await
             .map_err(|error| error.to_string())?;
-        self.attach_outbound(stream, peer_device_id).await
+        self.attach_outbound_ticket(stream, peer_device_id).await
     }
 
     pub fn shutdown(&self) {
@@ -357,22 +401,28 @@ impl PeerRuntimeHandle {
 
 /// Choose exactly one connection for an outbound frame. An explicit target
 /// wins over every other selection rule so a handoff frame cannot be delivered
-/// to a peer whose device ID does not match the frame.
+/// to a peer whose device ID does not match the frame. With no target, only the
+/// single outbound connection may be used; an arbitrary accepted connection is
+/// never selected by hash order.
 fn select_send_key(
     connections: &HashMap<PeerKey, Connection>,
     target: Option<&str>,
 ) -> Option<PeerKey> {
     if let Some(target) = target {
+        if connections
+            .get(&PeerKey::Outbound)
+            .is_some_and(|connection| connection.peer_device_id == target)
+        {
+            return Some(PeerKey::Outbound);
+        }
         return connections
             .iter()
             .find(|(_, connection)| connection.peer_device_id == target)
             .map(|(key, _)| *key);
     }
-    if connections.contains_key(&PeerKey::Outbound) {
-        Some(PeerKey::Outbound)
-    } else {
-        connections.keys().copied().next()
-    }
+    connections
+        .contains_key(&PeerKey::Outbound)
+        .then_some(PeerKey::Outbound)
 }
 
 fn peer_keys_for_device(
@@ -542,7 +592,12 @@ impl PeerRuntime {
                 ack,
             } => {
                 let targeted = target.is_some();
-                let Some(key) = select_send_key(&self.connections, target.as_deref()) else {
+                // Default sends follow the one active peer chosen by the
+                // runtime; they never fall through to arbitrary connections.
+                let effective = target.or_else(|| {
+                    self.active_peer_id.lock().unwrap().clone()
+                });
+                let Some(key) = select_send_key(&self.connections, effective.as_deref()) else {
                     // A handoff frame addressed to a peer that was revoked or
                     // disconnected while it was queued is a dropped frame, not
                     // a fatal transport error. Breaking the single forwarding
@@ -626,8 +681,40 @@ impl PeerRuntime {
                 );
                 self.peer_device_id = peer_device_id.clone();
                 self.peer_connected.store(true, Ordering::SeqCst);
-                *self.active_peer_id.lock().unwrap() = Some(peer_device_id);
-                let _ = ack.send(());
+                *self.active_peer_id.lock().unwrap() = Some(peer_device_id.clone());
+                let _ = ack.send(ConnectionTicket {
+                    peer_device_id,
+                    generation,
+                });
+            }
+            RuntimeCommand::SendToConnection {
+                message,
+                ticket,
+                ack,
+            } => {
+                // Setup frames are bound to the exact connection instance that
+                // created the ticket. A replaced connection must never receive
+                // a Hello intended for its predecessor.
+                let key = self
+                    .connections
+                    .iter()
+                    .find(|(_, connection)| {
+                        connection.generation == ticket.generation
+                            && connection.peer_device_id == ticket.peer_device_id
+                    })
+                    .map(|(key, _)| *key);
+                let Some(key) = key else {
+                    let _ = ack.send(Err("connection is no longer active".into()));
+                    return;
+                };
+                if let Some(connection) = self.connections.get(&key) {
+                    let _ = connection.tx.send(OutgoingFrame {
+                        message,
+                        ack: Some(ack),
+                    });
+                } else {
+                    let _ = ack.send(Err("connection is no longer active".into()));
+                }
             }
             RuntimeCommand::AttachInbound {
                 stream,
@@ -1250,6 +1337,79 @@ mod tests {
         assert_eq!(
             select_send_key(&connections, Some("pc-b")),
             Some(PeerKey::Accepted(2))
+        );
+    }
+
+    #[test]
+    fn default_send_never_uses_arbitrary_accepted_peer() {
+        // Regression: with several inbound peers and no selected active peer,
+        // HashMap iteration order decided where clipboard/file data went.
+        let mut connections = HashMap::new();
+        connections.insert(PeerKey::Accepted(1), connection("pc-b"));
+        connections.insert(PeerKey::Accepted(2), connection("pc-c"));
+
+        assert_eq!(select_send_key(&connections, None), None);
+    }
+
+    #[tokio::test]
+    async fn hello_is_bound_to_its_connection_generation() {
+        // Regression: two concurrent connectPeer RPCs could both attach outbound
+        // connections and the first Hello was written to the replacement peer.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+
+        let (client_a, _server_a) = tokio::io::duplex(64);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::AttachOutbound {
+            stream: crate::transport::PeerStream::from_test_duplex(client_a),
+            peer_device_id: "pc-b".into(),
+            ack: ack_tx,
+        });
+        let ticket_a = ack_rx.await.unwrap();
+
+        let (client_b, _server_b) = tokio::io::duplex(64);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::AttachOutbound {
+            stream: crate::transport::PeerStream::from_test_duplex(client_b),
+            peer_device_id: "pc-c".into(),
+            ack: ack_tx,
+        });
+        let _ticket_b = ack_rx.await.unwrap();
+
+        // Observe writes on the live connection while keeping its real ticket.
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let replacement = runtime.connections.get(&PeerKey::Outbound).unwrap();
+        let generation = replacement.generation;
+        let peer_device_id = replacement.peer_device_id.clone();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx: new_tx,
+                tasks: Vec::new(),
+                generation,
+                peer_device_id,
+            },
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::SendToConnection {
+            message: Message::Hello {
+                version: 2,
+                device_id: "pc-a".into(),
+                name: "A".into(),
+            },
+            ticket: ticket_a,
+            ack: ack_tx,
+        });
+
+        let result = ack_rx.await.unwrap();
+        assert!(result.is_err(), "a Hello bound to a replaced connection must fail");
+        assert!(
+            new_rx.try_recv().is_err(),
+            "a stale Hello must never be written to the replacement peer"
         );
     }
 
