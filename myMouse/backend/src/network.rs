@@ -137,7 +137,12 @@ enum RuntimeCommand {
     /// through the command channel lets the runtime service heartbeats, inbound
     /// frames and cancellation between chunks instead of blocking on a full
     /// file-sized synchronous drain.
-    PumpFileTransfer { transfer_id: String, peer: PeerKey },
+    PumpFileTransfer {
+        transfer_id: String,
+        peer: PeerKey,
+        generation: u64,
+        peer_device_id: String,
+    },
     Status {
         ack: oneshot::Sender<bool>,
     },
@@ -619,8 +624,14 @@ impl PeerRuntime {
                 }
                 let _ = ack.send(Ok(()));
             }
-            RuntimeCommand::PumpFileTransfer { transfer_id, peer } => {
-                if !self.connections.contains_key(&peer) {
+            RuntimeCommand::PumpFileTransfer {
+                transfer_id,
+                peer,
+                generation,
+                peer_device_id,
+            } => {
+                if !self.connection_matches(peer, generation, &peer_device_id) {
+                    self.fail_transfer(&transfer_id, "peer connection changed");
                     return;
                 }
                 let next = {
@@ -631,10 +642,16 @@ impl PeerRuntime {
                 };
                 match next {
                     Ok(messages) if messages.is_empty() => {
-                        emit_transfer_failure(&transfer_id, "transfer produced no chunks");
+                        self.fail_transfer(&transfer_id, "transfer produced no chunks");
                     }
-                    Ok(messages) => self.queue_transfer_step(&transfer_id, peer, messages),
-                    Err(error) => emit_transfer_failure(&transfer_id, &error.to_string()),
+                    Ok(messages) => self.queue_transfer_step(
+                        &transfer_id,
+                        peer,
+                        generation,
+                        &peer_device_id,
+                        messages,
+                    ),
+                    Err(error) => self.fail_transfer(&transfer_id, &error.to_string()),
                 }
             }
             RuntimeCommand::ConnectionClosed { key, generation } => {
@@ -681,6 +698,29 @@ impl PeerRuntime {
         }
     }
 
+    /// A queued command is only valid for the exact connection instance that
+    /// created it. `PeerKey::Outbound` is reused when a new peer replaces the
+    /// old one, so the key alone must never authorize another chunk.
+    fn connection_matches(&self, key: PeerKey, generation: u64, peer_device_id: &str) -> bool {
+        self.connections.get(&key).is_some_and(|connection| {
+            connection.generation == generation && connection.peer_device_id == peer_device_id
+        })
+    }
+
+    /// Record a terminal failure so `listTransfers` agrees with the emitted
+    /// `transferUpdate`. Already-terminal history is preserved.
+    fn fail_transfer(&mut self, transfer_id: &str, message: &str) {
+        let record = {
+            let mut state = self.state.lock().unwrap();
+            state.transfers.mark_failed(transfer_id, message)
+        };
+        if let Some(record) = record {
+            emit_transfer_record(&record);
+        } else {
+            emit_transfer_failure(transfer_id, message);
+        }
+    }
+
     fn send_to(&mut self, key: PeerKey, message: Message) {
         if let Some(connection) = self.connections.get(&key) {
             let _ = connection.tx.send(OutgoingFrame {
@@ -693,7 +733,32 @@ impl PeerRuntime {
     /// Emit history, send one step of an outgoing transfer, and only then ask
     /// the runtime for the next turn. This keeps a large transfer from blocking
     /// heartbeat and command processing.
-    fn queue_transfer_step(&mut self, transfer_id: &str, peer: PeerKey, messages: Vec<Message>) {
+    fn queue_transfer_step(
+        &mut self,
+        transfer_id: &str,
+        peer: PeerKey,
+        generation: u64,
+        peer_device_id: &str,
+        messages: Vec<Message>,
+    ) {
+        if !self.connection_matches(peer, generation, peer_device_id) {
+            self.fail_transfer(transfer_id, "peer connection changed");
+            return;
+        }
+        let record_peer = {
+            let state = self.state.lock().unwrap();
+            state
+                .transfers
+                .history()
+                .iter()
+                .rev()
+                .find(|entry| entry.transfer_id == transfer_id)
+                .map(|entry| entry.peer_device_id.clone())
+        };
+        if record_peer.as_deref() != Some(peer_device_id) {
+            self.fail_transfer(transfer_id, "transfer target changed");
+            return;
+        }
         let completed = messages
             .iter()
             .any(|message| matches!(message, Message::FileTransferComplete { .. }));
@@ -725,12 +790,16 @@ impl PeerRuntime {
             }
             return;
         }
-        // Do not keep generating chunks after the peer connection is gone.
-        if self.connections.contains_key(&peer) {
+        // Only ask for another chunk if the exact connection is still live.
+        if self.connection_matches(peer, generation, peer_device_id) {
             let _ = self.command_sender.send(RuntimeCommand::PumpFileTransfer {
                 transfer_id: transfer_id.to_string(),
                 peer,
+                generation,
+                peer_device_id: peer_device_id.to_string(),
             });
+        } else {
+            self.fail_transfer(transfer_id, "peer connection changed");
         }
     }
 
@@ -821,8 +890,14 @@ impl PeerRuntime {
                     state.transfers.handle_accept(&transfer_id)
                 };
                 match result {
-                    Ok(messages) => self.queue_transfer_step(&transfer_id, frame.key, messages),
-                    Err(error) => emit_transfer_failure(&transfer_id, &error.to_string()),
+                    Ok(messages) => self.queue_transfer_step(
+                        &transfer_id,
+                        frame.key,
+                        frame.generation,
+                        &frame.peer_device_id,
+                        messages,
+                    ),
+                    Err(error) => self.fail_transfer(&transfer_id, &error.to_string()),
                 }
             }
             Message::FileTransferReject { transfer_id, reason } => {
@@ -832,7 +907,7 @@ impl PeerRuntime {
                 };
                 match record {
                     Some(record) => emit_transfer_record(&record),
-                    None => emit_transfer_failure(&transfer_id, "unknown transfer"),
+                    None => self.fail_transfer(&transfer_id, "unknown transfer"),
                 }
             }
             Message::FileTransferChunk(chunk) => {
@@ -854,8 +929,8 @@ impl PeerRuntime {
                 };
                 match result {
                     Ok(Some(record)) => emit_transfer_record(&record),
-                    Ok(None) => emit_transfer_failure(&transfer_id, "chunk had no transfer record"),
-                    Err(error) => emit_transfer_failure(&transfer_id, &error.to_string()),
+                    Ok(None) => self.fail_transfer(&transfer_id, "chunk had no transfer record"),
+                    Err(error) => self.fail_transfer(&transfer_id, &error.to_string()),
                 }
             }
             Message::FileTransferComplete { transfer_id } => {
@@ -865,7 +940,7 @@ impl PeerRuntime {
                 };
                 match result {
                     Ok(record) => emit_transfer_record(&record),
-                    Err(error) => emit_transfer_failure(&transfer_id, &error.to_string()),
+                    Err(error) => self.fail_transfer(&transfer_id, &error.to_string()),
                 }
             }
             Message::FileTransferCancel { transfer_id, reason } => {
@@ -875,7 +950,7 @@ impl PeerRuntime {
                 };
                 match record {
                     Some(record) => emit_transfer_record(&record),
-                    None => emit_transfer_failure(&transfer_id, "unknown transfer"),
+                    None => self.fail_transfer(&transfer_id, "unknown transfer"),
                 }
             }
             Message::InputEvent { target, payload } => {
@@ -1317,6 +1392,198 @@ mod tests {
         assert_eq!(chunk_count, 3, "all file chunks must be sent by the pump");
         assert_eq!(chunk_bytes, size, "all file bytes must be sent by the pump");
         assert_eq!(complete_count, 1, "transfer must complete by the pump");
+    }
+
+    #[tokio::test]
+    async fn pump_cannot_send_a_replaced_outbound_peers_file_chunks() {
+        // Regression: PumpFileTransfer carried only PeerKey::Outbound. A pump
+        // queued for pc-b could be processed after pc-c replaced that key,
+        // sending pc-b's file bytes to the wrong trusted peer.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("replaced.bin");
+        let size = crate::file_transfer::DEFAULT_CHUNK_BYTES * 2 + 17;
+        std::fs::write(&source, vec![7u8; size]).unwrap();
+
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        let (offer, _) = app.transfers.create_offer(&source, "pc-b").unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx: old_tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Outbound,
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+            message: Message::FileTransferAccept {
+                transfer_id: offer.transfer_id.clone(),
+            },
+        });
+        while old_rx.try_recv().is_ok() {}
+
+        let queued_pump = runtime
+            .commands
+            .try_recv()
+            .expect("accept must queue an incremental pump");
+
+        let (client, _server) = tokio::io::duplex(64);
+        let stream = crate::transport::PeerStream::from_test_duplex(client);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::AttachOutbound {
+            stream,
+            peer_device_id: "pc-c".into(),
+            ack: ack_tx,
+        });
+        ack_rx.await.unwrap();
+
+        // Keep the replacement connection's real generation and peer id, but
+        // route its writes to an observable channel.
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let replacement = runtime.connections.get(&PeerKey::Outbound).unwrap();
+        let generation = replacement.generation;
+        let peer_device_id = replacement.peer_device_id.clone();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx: new_tx,
+                tasks: Vec::new(),
+                generation,
+                peer_device_id,
+            },
+        );
+
+        runtime.handle_command(queued_pump);
+
+        assert!(
+            new_rx.try_recv().is_err(),
+            "a pump queued for pc-b must not send file chunks to replacement pc-c"
+        );
+        let record = {
+            let state = runtime.state.lock().unwrap();
+            state
+                .transfers
+                .history()
+                .iter()
+                .rev()
+                .find(|entry| entry.transfer_id == offer.transfer_id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(record.state, crate::file_transfer::TransferState::Failed);
+    }
+
+    #[test]
+    fn truncated_offer_marks_outgoing_history_failed() {
+        // Regression: a zero-progress read emitted a failed transferUpdate but
+        // left the transfer InProgress in listTransfers forever.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("truncated.bin");
+        std::fs::write(&source, vec![9u8; 64]).unwrap();
+
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        let (offer, _) = app.transfers.create_offer(&source, "pc-b").unwrap();
+        std::fs::write(&source, Vec::new()).unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Outbound,
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+            message: Message::FileTransferAccept {
+                transfer_id: offer.transfer_id.clone(),
+            },
+        });
+
+        let record = {
+            let state = runtime.state.lock().unwrap();
+            state
+                .transfers
+                .history()
+                .iter()
+                .rev()
+                .find(|entry| entry.transfer_id == offer.transfer_id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(record.state, crate::file_transfer::TransferState::Failed);
+        assert!(record.message.unwrap().contains("file ended"));
+    }
+
+    #[test]
+    fn truncated_file_during_pump_marks_outgoing_history_failed() {
+        // Regression: a file that shrinks between chunks failed the pump but
+        // left the history InProgress, so the UI never saw a terminal state.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shrinking.bin");
+        let size = crate::file_transfer::DEFAULT_CHUNK_BYTES * 2;
+        std::fs::write(&source, vec![5u8; size]).unwrap();
+
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        let (offer, _) = app.transfers.create_offer(&source, "pc-b").unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Outbound,
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+            message: Message::FileTransferAccept {
+                transfer_id: offer.transfer_id.clone(),
+            },
+        });
+        while rx.try_recv().is_ok() {}
+        let queued_pump = runtime
+            .commands
+            .try_recv()
+            .expect("accept must queue an incremental pump");
+        std::fs::write(&source, Vec::new()).unwrap();
+
+        runtime.handle_command(queued_pump);
+
+        let record = {
+            let state = runtime.state.lock().unwrap();
+            state
+                .transfers
+                .history()
+                .iter()
+                .rev()
+                .find(|entry| entry.transfer_id == offer.transfer_id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(record.state, crate::file_transfer::TransferState::Failed);
     }
 
     #[test]

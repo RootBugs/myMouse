@@ -607,6 +607,46 @@ impl FileTransferManager {
         None
     }
 
+    /// Record a terminal failure in history. Active transfers are removed so a
+    /// stale pump cannot restart them; already-terminal history is preserved.
+    pub fn mark_failed(&mut self, transfer_id: &str, message: &str) -> Option<TransferRecord> {
+        if let Some(mut outgoing) = self.outgoing.remove(transfer_id) {
+            outgoing.record.state = TransferState::Failed;
+            outgoing.record.message = Some(message.to_string());
+            outgoing.record.updated_at_ms = now_ms();
+            self.push_history(outgoing.record.clone());
+            return Some(outgoing.record);
+        }
+        if let Some(mut incoming) = self.incoming.remove(transfer_id) {
+            let _ = fs::remove_file(&incoming.part_path);
+            incoming.record.state = TransferState::Failed;
+            incoming.record.message = Some(message.to_string());
+            incoming.record.updated_at_ms = now_ms();
+            self.push_history(incoming.record.clone());
+            return Some(incoming.record);
+        }
+        let mut record = self
+            .history
+            .iter()
+            .rev()
+            .find(|entry| entry.transfer_id == transfer_id)?
+            .clone();
+        if matches!(
+            record.state,
+            TransferState::Completed
+                | TransferState::Rejected
+                | TransferState::Cancelled
+                | TransferState::Failed
+        ) {
+            return Some(record);
+        }
+        record.state = TransferState::Failed;
+        record.message = Some(message.to_string());
+        record.updated_at_ms = now_ms();
+        self.push_history(record.clone());
+        Some(record)
+    }
+
     pub fn mark_outgoing_complete(&mut self, transfer_id: &str) -> Option<TransferRecord> {
         if let Some(mut outgoing) = self.outgoing.remove(transfer_id) {
             outgoing.record.state = TransferState::Completed;

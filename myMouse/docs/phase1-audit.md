@@ -90,9 +90,9 @@ unit-tested and wired**; both **not physically tested**.
   [benchmarks.md](benchmarks.md). It is a **two-process loopback harness** on
   one Windows host: not field latency, not a physical two-PC session, and not a
   comparison with any upstream product.
-- Measured values on this host: input delivery 25.31 ms, clipboard 7.019
-  Mbit/s, file 6.966 Mbit/s, cold pinned-TLS connect 236.6 ms, idle CPU 0% on
-  both processes, idle RAM 12.12/11.82 MiB. Reconnect after peer loss is
+- Measured values on this host: input delivery 8.9 ms, clipboard 15.688
+  Mbit/s, file 15.307 Mbit/s, cold pinned-TLS connect 121.46 ms, idle CPU
+  0/0% on the two processes, idle RAM 12.07/11.81 MiB. Reconnect after peer loss is
   deliberately `null`/unmeasured because test mode has no auto-reconnect loop.
 - Benchmarking exposed a real production bug: file transfers above one 256 KiB
   chunk stalled after the first chunk. The regression test
@@ -106,6 +106,13 @@ unit-tested and wired**; both **not physically tested**.
   gate preservation are unit-tested. The watchdog never writes `input_gate`, so
   emergency stop remains authoritative. Large file chunks are now pumped one
   event-loop turn at a time, and both quit and IPC-EOF release injected input.
+- A second full-branch review found a stale-pump confidentiality defect: a pump
+  queued before `AttachOutbound` replaced the outbound peer could send the old
+  peer's file chunks to the replacement. Pumps now carry the connection
+  generation and peer id, and are rejected if either changes. Transfer failures
+  now update `TransferState::Failed` in history, so `listTransfers` agrees with
+  `transferUpdate`. Both regressions are unit-tested; terminal history is not
+  overwritten by late notices.
 - Windows `SendInput` release effects and a physical silent-peer/held-key
   interruption were **not** hardware-audited. No superiority or field-latency
   claim follows from this increment.
@@ -134,7 +141,7 @@ Commands were run from `myMouse/` unless noted.
 
 | Command | Result |
 | --- | --- |
-| `cargo test` in `myMouse/backend` | `77 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
+| `cargo test` in `myMouse/backend` | `80 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
 | `cargo test` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
 | `npm test -- --run` | `5 files / 19 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
 | `npm run build` | exit 0; Vite produced `index.html`, CSS, and JS assets; Electron TypeScript build succeeded |
