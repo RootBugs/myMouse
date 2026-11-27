@@ -9,6 +9,7 @@
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "tsc --noEmit && vite build && npm run build:electron",
     "test": "vitest",
+    "test:ci": "vitest run",
     "smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-two-instances.ps1",
     "benchmark": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark.ps1",
     "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File installer/build-windows.ps1"
