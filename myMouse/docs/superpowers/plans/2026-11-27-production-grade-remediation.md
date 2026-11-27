@@ -110,8 +110,8 @@ In `file_transfer.rs` add ownership query tests for outgoing and incoming record
 
 - [ ] **Step 2: Run focused red test**
 
-Run: `cargo test --manifest-path backend/Cargo.toml control_messages_require_files_and_ownership -- --exact`
-Expected: FAIL.
+Run: `cargo test --manifest-path backend/Cargo.toml network::tests::control_messages_require_files_and_ownership -- --exact`
+Expected: FAIL (`--exact` needs the fully qualified Rust test path).
 
 - [ ] **Step 3: Implement the gate**
 

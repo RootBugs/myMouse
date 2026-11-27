@@ -180,6 +180,18 @@ impl FileTransferManager {
         &self.history
     }
 
+    pub fn owns_outgoing(&self, transfer_id: &str, peer_device_id: &str) -> bool {
+        self.outgoing
+            .get(transfer_id)
+            .is_some_and(|transfer| transfer.record.peer_device_id == peer_device_id)
+    }
+
+    pub fn owns_incoming(&self, transfer_id: &str, peer_device_id: &str) -> bool {
+        self.incoming
+            .get(transfer_id)
+            .is_some_and(|transfer| transfer.record.peer_device_id == peer_device_id)
+    }
+
     fn push_history(&mut self, record: TransferRecord) {
         if let Some(existing) = self.history.iter_mut().find(|r| r.transfer_id == record.transfer_id) {
             *existing = record;
@@ -984,5 +996,30 @@ mod tests {
             .find(|r| r.transfer_id == "disconnect-1")
             .expect("history keeps the interrupted transfer");
         assert_eq!(record.state, TransferState::Cancelled);
+    }
+
+    #[test]
+    fn ownership_queries_match_record_direction_and_peer() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("owned.txt");
+        std::fs::write(&source, b"hello").unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+
+        let (offer, _) = mgr.create_offer(&source, "pc-b").unwrap();
+        assert!(mgr.owns_outgoing(&offer.transfer_id, "pc-b"));
+        assert!(!mgr.owns_outgoing(&offer.transfer_id, "pc-c"));
+        assert!(!mgr.owns_incoming(&offer.transfer_id, "pc-b"));
+
+        mgr.handle_offer(offer_with_id("incoming-1", 4, "x"), "pc-c");
+        assert!(mgr.owns_incoming("incoming-1", "pc-c"));
+        assert!(!mgr.owns_incoming("incoming-1", "pc-b"));
+        assert!(!mgr.owns_outgoing("incoming-1", "pc-c"));
     }
 }

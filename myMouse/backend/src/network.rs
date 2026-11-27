@@ -36,26 +36,74 @@ pub fn liveness_expires(last: Instant, now: Instant, timeout: Duration) -> bool 
 }
 
 /// Capability flags are enforced for every inbound message class, not just
-/// during the Hello handshake. Control messages remain allowed so a peer can
-/// accept/reject an offer it did not originate.
+/// during the Hello handshake. File control messages require `files` too; a
+/// revoked peer has no capabilities and cannot manipulate transfers.
 fn message_allowed_by_capabilities(capabilities: Option<&Capabilities>, message: &Message) -> bool {
+    let is_file_message = matches!(
+        message,
+        Message::FileTransferOffer(_)
+            | Message::FileTransferAccept { .. }
+            | Message::FileTransferReject { .. }
+            | Message::FileTransferChunk(_)
+            | Message::FileTransferComplete { .. }
+            | Message::FileTransferCancel { .. }
+    );
     let Some(capabilities) = capabilities else {
         return !matches!(
             message,
-            Message::InputEvent { .. }
-                | Message::ClipboardUpdate(_)
-                | Message::FileTransferOffer(_)
-                | Message::FileTransferChunk(_)
-                | Message::FileTransferComplete { .. }
-        );
+            Message::InputEvent { .. } | Message::ClipboardUpdate(_)
+        ) && !is_file_message;
     };
     match message {
         Message::InputEvent { .. } => capabilities.input,
         Message::ClipboardUpdate(_) => capabilities.clipboard,
-        Message::FileTransferOffer(_)
-        | Message::FileTransferChunk(_)
-        | Message::FileTransferComplete { .. } => capabilities.files,
+        _ if is_file_message => capabilities.files,
         _ => true,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferOwnership {
+    Outgoing,
+    Incoming,
+}
+
+fn transfer_message_target(message: &Message) -> Option<(&str, TransferOwnership)> {
+    match message {
+        Message::FileTransferAccept { transfer_id }
+        | Message::FileTransferReject { transfer_id, .. }
+        | Message::FileTransferCancel { transfer_id, .. } => {
+            Some((transfer_id, TransferOwnership::Outgoing))
+        }
+        Message::FileTransferChunk(chunk) => Some((&chunk.transfer_id, TransferOwnership::Incoming)),
+        Message::FileTransferComplete { transfer_id } => {
+            Some((transfer_id, TransferOwnership::Incoming))
+        }
+        _ => None,
+    }
+}
+
+fn reject_message(device_id: &str, reason: &str) -> serde_json::Value {
+    json!({
+        "notification": "messageRejected",
+        "deviceId": device_id,
+        "reason": reason,
+    })
+}
+
+fn message_allowed_by_ownership(
+    state: &AppState,
+    peer_device_id: &str,
+    message: &Message,
+) -> bool {
+    match transfer_message_target(message) {
+        None => true,
+        Some((transfer_id, TransferOwnership::Outgoing)) => {
+            state.transfers.owns_outgoing(transfer_id, peer_device_id)
+        }
+        Some((transfer_id, TransferOwnership::Incoming)) => {
+            state.transfers.owns_incoming(transfer_id, peer_device_id)
+        }
     }
 }
 
@@ -829,11 +877,18 @@ impl PeerRuntime {
                 .cloned()
         };
         if !message_allowed_by_capabilities(capabilities.as_ref(), &frame.message) {
-            emit(json!({
-                "notification": "messageRejected",
-                "deviceId": frame.peer_device_id,
-                "reason": "capability not granted",
-            }));
+            emit(reject_message(&frame.peer_device_id, "capability not granted"));
+            return;
+        }
+        let ownership_allowed = {
+            let state = self.state.lock().unwrap();
+            message_allowed_by_ownership(&state, &frame.peer_device_id, &frame.message)
+        };
+        if !ownership_allowed {
+            emit(reject_message(
+                &frame.peer_device_id,
+                "transfer ownership mismatch",
+            ));
             return;
         }
         match frame.message {
@@ -1814,5 +1869,68 @@ mod tests {
                 name: "Peer".into(),
             }
         ));
+    }
+
+    #[test]
+    fn control_messages_require_files_and_ownership() {
+        let no_files = Capabilities {
+            input: true,
+            clipboard: true,
+            files: false,
+            screen: false,
+        };
+        let accept = Message::FileTransferAccept {
+            transfer_id: "t1".into(),
+        };
+        let cancel = Message::FileTransferCancel {
+            transfer_id: "t1".into(),
+            reason: None,
+        };
+        assert!(!message_allowed_by_capabilities(
+            Some(&no_files),
+            &accept
+        ));
+        assert!(!message_allowed_by_capabilities(
+            Some(&no_files),
+            &cancel
+        ));
+        assert!(!message_allowed_by_capabilities(None, &accept));
+        assert!(!message_allowed_by_capabilities(None, &cancel));
+
+        let rejected = reject_message("pc-b", "transfer ownership mismatch");
+        assert_eq!(rejected["notification"], "messageRejected");
+        assert_eq!(rejected["deviceId"], "pc-b");
+        assert_eq!(rejected["reason"], "transfer ownership mismatch");
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("owned.txt");
+        std::fs::write(&source, b"hello").unwrap();
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.trust.grant("pc-b", caps());
+        app.trust.grant("pc-c", caps());
+        let (offer, _) = app.transfers.create_offer(&source, "pc-c").unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Accepted(1),
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+            message: Message::FileTransferCancel {
+                transfer_id: offer.transfer_id.clone(),
+                reason: None,
+            },
+        });
+
+        let state = runtime.state.lock().unwrap();
+        let record = state
+            .transfers
+            .history()
+            .iter()
+            .rev()
+            .find(|entry| entry.transfer_id == offer.transfer_id)
+            .expect("the offer history record must survive");
+        assert_eq!(record.peer_device_id, "pc-c");
+        assert_eq!(record.state, crate::file_transfer::TransferState::Offered);
     }
 }
