@@ -464,6 +464,9 @@ struct PeerRuntime {
     input_source: Option<String>,
     /// Peer whose silence has already triggered a release in this episode.
     watchdog_notified_for: Option<String>,
+    /// Seam for the host input release. Production uses the real OS bridge;
+    /// tests supply a deterministic releaser.
+    release_input: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl PeerRuntime {
@@ -507,6 +510,7 @@ impl PeerRuntime {
                 last_peer_frames: HashMap::new(),
                 input_source: None,
                 watchdog_notified_for: None,
+                release_input: Arc::new(InputBridge::release_all_injected),
             };
             runtime.run().await;
         });
@@ -575,15 +579,15 @@ impl PeerRuntime {
         if self.watchdog_notified_for.as_deref() == Some(source.as_str()) {
             return false;
         }
-        let held_input = InputBridge::release_all_injected();
+        let held_input = (self.release_input)();
         if held_input {
             emit(json!({
                 "notification": "inputLost",
                 "reason": "peer heartbeat timeout",
             }));
+            self.watchdog_notified_for = Some(source);
         }
-        self.watchdog_notified_for = Some(source);
-        true
+        held_input
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
@@ -645,6 +649,7 @@ impl PeerRuntime {
                     }
                 }
                 self.fail_peer_records(&peer_device_id);
+                self.release_input_source_for_peer(&peer_device_id);
                 self.refresh_active_peer();
                 let _ = ack.send(());
             }
@@ -816,6 +821,7 @@ impl PeerRuntime {
                 // same-peer reconnect keeps its new transfers alive.
                 if peer_keys_for_device(&self.connections, &peer_device_id).is_empty() {
                     self.fail_peer_records(&peer_device_id);
+                    self.release_input_source_for_peer(&peer_device_id);
                 }
             }
             RuntimeCommand::Status { ack } => {
@@ -878,6 +884,23 @@ impl PeerRuntime {
         for record in records {
             emit_transfer_record(&record);
         }
+    }
+
+    /// A removed peer can no longer own injection on this machine. Release its
+    /// held keys/buttons and forget both the owner and any armed watchdog
+    /// notice so a later peer is not judged against the departed one.
+    fn release_input_source_for_peer(&mut self, peer_device_id: &str) {
+        if self.input_source.as_deref() != Some(peer_device_id) {
+            return;
+        }
+        if (self.release_input)() {
+            emit(json!({
+                "notification": "inputLost",
+                "reason": "peer disconnected",
+            }));
+        }
+        self.input_source = None;
+        self.watchdog_notified_for = None;
     }
 
     fn send_to(&mut self, key: PeerKey, message: Message) {
@@ -1346,6 +1369,7 @@ fn emit_transfer_failure(transfer_id: &str, message: &str) {
 mod tests {
     use super::*;
     use crate::trust::Capabilities;
+    use std::sync::atomic::AtomicUsize;
 
     fn caps() -> Capabilities {
         Capabilities::default()
@@ -1497,6 +1521,7 @@ mod tests {
             last_peer_frames: HashMap::new(),
             input_source: None,
             watchdog_notified_for: None,
+            release_input: Arc::new(InputBridge::release_all_injected),
         };
         (runtime, peer_connected, active_peer_id)
     }
@@ -1624,6 +1649,9 @@ mod tests {
             crate::AppState::new(dir.path().to_path_buf()).unwrap(),
         ));
         let (mut runtime, _connected, _active) = test_runtime(state);
+        let release = Arc::new(AtomicBool::new(true));
+        let releaser = release.clone();
+        runtime.release_input = Arc::new(move || releaser.load(Ordering::SeqCst));
         let now = Instant::now();
 
         runtime.input_source = Some("pc-b".into());
@@ -1647,6 +1675,9 @@ mod tests {
             crate::AppState::new(dir.path().to_path_buf()).unwrap(),
         ));
         let (mut runtime, _connected, _active) = test_runtime(state);
+        let release = Arc::new(AtomicBool::new(true));
+        let releaser = release.clone();
+        runtime.release_input = Arc::new(move || releaser.load(Ordering::SeqCst));
         let now = Instant::now();
 
         runtime.input_source = Some("pc-a".into());
@@ -1657,6 +1688,117 @@ mod tests {
             runtime.check_liveness(now),
             "a different peer's heartbeat must not hide a silent input source"
         );
+    }
+
+    #[test]
+    fn watchdog_notice_requires_a_real_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let released = Arc::new(AtomicBool::new(false));
+        let releaser = released.clone();
+        runtime.release_input = Arc::new(move || releaser.load(Ordering::SeqCst));
+        let now = Instant::now();
+
+        runtime.input_source = Some("pc-b".into());
+        runtime.last_peer_frames.insert("pc-b".into(), now - Duration::from_secs(4));
+
+        assert!(
+            !runtime.check_liveness(now),
+            "no held input means there is no watchdog notice to arm"
+        );
+        assert_eq!(runtime.watchdog_notified_for, None);
+
+        released.store(true, Ordering::SeqCst);
+        assert!(runtime.check_liveness(now));
+        assert_eq!(runtime.watchdog_notified_for.as_deref(), Some("pc-b"));
+        assert!(
+            !runtime.check_liveness(now),
+            "one release must arm at most one notice per silent episode"
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_input_ownership_for_the_removed_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, connected, active) = test_runtime(state);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let counter = releases.clone();
+        runtime.release_input = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Outbound,
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        runtime.input_source = Some("pc-b".into());
+        runtime.watchdog_notified_for = Some("pc-b".into());
+        connected.store(true, Ordering::SeqCst);
+        *active.lock().unwrap() = Some("pc-b".into());
+
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::DisconnectPeer {
+            peer_device_id: "pc-b".into(),
+            ack: ack_tx,
+        });
+
+        assert_eq!(
+            runtime.input_source, None,
+            "a removed peer must not keep ownership of injected input"
+        );
+        assert_eq!(runtime.watchdog_notified_for, None);
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "held input must be released when its source disconnects"
+        );
+    }
+
+    #[test]
+    fn connection_closed_clears_input_ownership_when_no_replacement_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let counter = releases.clone();
+        runtime.release_input = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Accepted(1),
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        runtime.input_source = Some("pc-b".into());
+
+        runtime.handle_command(RuntimeCommand::ConnectionClosed {
+            key: PeerKey::Accepted(1),
+            generation: 1,
+            peer_device_id: "pc-b".into(),
+        });
+
+        assert_eq!(runtime.input_source, None);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

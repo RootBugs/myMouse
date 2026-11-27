@@ -10,6 +10,28 @@ const MAX_CLIPBOARD_BYTES: usize = 512 * 1024;
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 640 * 1024;
 const MAX_PROTOCOL_FRAME_BYTES: usize = mymouse_protocol::MAX_ENCODED_FRAME_LEN;
 
+/// Number of UTF-16 code units before the first NUL in `bytes`.
+///
+/// `None` means the buffer cannot be read safely: a partial code unit, no
+/// terminator inside the allocated bytes, or text longer than `max_chars`.
+pub(crate) fn utf16_prefix_len(bytes: &[u8], max_chars: usize) -> Option<usize> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut units = 0usize;
+    for pair in bytes.chunks_exact(2) {
+        let unit = u16::from_ne_bytes([pair[0], pair[1]]);
+        if unit == 0 {
+            return Some(units);
+        }
+        units += 1;
+        if units > max_chars {
+            return None;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardMode {
@@ -247,6 +269,38 @@ pub mod os {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     }
 
+    /// Read one CF_UNICODETEXT buffer. The scan is bounded by `GlobalSize` and
+    /// the shared clipboard byte policy, so a clipboard owner that omits the
+    /// terminator cannot make us read beyond its allocation.
+    fn read_unicode_text(hglobal: HGLOBAL) -> Option<ClipboardSnapshot> {
+        unsafe {
+            let ptr = GlobalLock(hglobal) as *const u8;
+            if ptr.is_null() {
+                return None;
+            }
+            let size = GlobalSize(hglobal);
+            if size == 0 || size % 2 != 0 || size > super::MAX_CLIPBOARD_BYTES {
+                let _ = GlobalUnlock(hglobal);
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(ptr, size);
+            let Some(units) =
+                super::utf16_prefix_len(bytes, super::MAX_CLIPBOARD_BYTES / 2)
+            else {
+                let _ = GlobalUnlock(hglobal);
+                return None;
+            };
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr as *const u16, units));
+            let _ = GlobalUnlock(hglobal);
+            Some(ClipboardSnapshot {
+                kind: ClipboardKind::Text,
+                text: Some(text),
+                data_base64: None,
+                mime: Some("text/plain".into()),
+            })
+        }
+    }
+
     pub fn read() -> Option<ClipboardSnapshot> {
         unsafe {
             if OpenClipboard(None).is_err() {
@@ -255,23 +309,8 @@ pub mod os {
             let result = (|| {
                 if IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok() {
                     if let Ok(handle) = GetClipboardData(CF_UNICODETEXT) {
-                        let hglobal = HGLOBAL(handle.0);
-                        let ptr = GlobalLock(hglobal) as *const u16;
-                        if !ptr.is_null() {
-                            let mut len = 0usize;
-                            while *ptr.add(len) != 0 {
-                                len += 1;
-                                if len > 262144 { break; }
-                            }
-                            let slice = std::slice::from_raw_parts(ptr, len);
-                            let text = String::from_utf16_lossy(slice);
-                            let _ = GlobalUnlock(hglobal);
-                            return Some(ClipboardSnapshot {
-                                kind: ClipboardKind::Text,
-                                text: Some(text),
-                                data_base64: None,
-                                mime: Some("text/plain".into()),
-                            });
+                        if let Some(snapshot) = read_unicode_text(HGLOBAL(handle.0)) {
+                            return Some(snapshot);
                         }
                     }
                 }
@@ -519,6 +558,47 @@ mod tests {
         assert!(
             mgr.build_update(over_snapshot).is_none(),
             "an image above the bound must be rejected before it can break the frame cap"
+        );
+    }
+
+    fn wide_bytes(units: &[u16]) -> Vec<u8> {
+        units.iter().flat_map(|unit| unit.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn utf16_prefix_len_uses_the_terminator_within_the_buffer() {
+        let bytes = wide_bytes(&['h' as u16, 'i' as u16, 0, 0xFFFF]);
+        assert_eq!(utf16_prefix_len(&bytes, 8), Some(2));
+    }
+
+    #[test]
+    fn utf16_prefix_len_rejects_odd_allocation() {
+        let bytes = wide_bytes(&['h' as u16, 'i' as u16]);
+        assert_eq!(
+            utf16_prefix_len(&bytes[..bytes.len() - 1], 8),
+            None,
+            "a partial UTF-16 code unit must not be read from a hostile clipboard buffer"
+        );
+    }
+
+    #[test]
+    fn utf16_prefix_len_rejects_unterminated_buffer() {
+        let bytes = wide_bytes(&['h' as u16, 'i' as u16]);
+        assert_eq!(
+            utf16_prefix_len(&bytes, 8),
+            None,
+            "scanning past GlobalSize would read memory the clipboard owner never allocated"
+        );
+    }
+
+    #[test]
+    fn utf16_prefix_len_rejects_text_past_char_limit() {
+        let bytes = wide_bytes(&['a' as u16, 'b' as u16, 'c' as u16, 0]);
+        assert_eq!(utf16_prefix_len(&bytes, 3), Some(3));
+        assert_eq!(
+            utf16_prefix_len(&bytes, 2),
+            None,
+            "a long clipboard string must be bounded before it reaches the protocol frame cap"
         );
     }
 }

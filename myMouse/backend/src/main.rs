@@ -231,6 +231,19 @@ fn is_hex_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Resolve the local monitor from the persisted topology. Layout validation
+/// already bounds each index; with several local monitors the lowest index is
+/// the deterministic local primary, and an unconfigured device keeps index 0.
+fn local_monitor_index(layout: &Layout, local_device_id: &str) -> usize {
+    layout
+        .nodes()
+        .iter()
+        .filter(|node| node.device_id == local_device_id)
+        .map(|node| node.monitor_index as usize)
+        .min()
+        .unwrap_or(0)
+}
+
 /// Production peers announce themselves on every outbound connection so the
 /// remote listener's trust gate can identify them before dispatching data.
 fn hello_message(state: &Arc<Mutex<AppState>>) -> Message {
@@ -909,10 +922,11 @@ async fn run_ipc() -> Result<(), String> {
         let st = state.lock().unwrap();
         (st.layout.clone(), st.device_id.clone())
     };
+    let monitor_index = local_monitor_index(&layout.read().unwrap(), &local_device_id);
     let bridge = Arc::new(Mutex::new(InputBridge::with_topology(
         layout,
         &local_device_id,
-        0,
+        monitor_index as u32,
         input_tx,
         Arc::new(move || gate_network.connected_now()),
         Arc::new(move || active_peer_id.lock().unwrap().clone()),
@@ -1046,6 +1060,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use layout::Node;
     use std::sync::{Arc, Mutex};
     use trust::Capabilities;
 
@@ -1299,6 +1314,32 @@ mod tests {
         assert_eq!(state.layout.read().unwrap().clone(), applied);
         let after_reject = std::fs::read_to_string(dir.path().join("layout.json")).unwrap();
         assert_eq!(after_reject, disk);
+    }
+
+    #[test]
+    fn local_monitor_index_uses_persisted_local_node() {
+        let mut layout = Layout::new();
+        layout.add_node(Node::monitor("pc-b", 0, 101, 201));
+        layout.add_node(Node::monitor("pc-a", 2, 101, 201));
+
+        assert_eq!(
+            local_monitor_index(&layout, "pc-a"),
+            2,
+            "the local monitor index must come from the local node, not the peer or a hardcoded 0"
+        );
+    }
+
+    #[test]
+    fn local_monitor_index_uses_lowest_local_node_and_falls_back_to_zero() {
+        let mut layout = Layout::new();
+        layout.add_node(Node::monitor("pc-a", 3, 101, 201));
+        layout.add_node(Node::monitor("pc-a", 1, 101, 201));
+        assert_eq!(local_monitor_index(&layout, "pc-a"), 1);
+        assert_eq!(
+            local_monitor_index(&layout, "missing"),
+            0,
+            "an unconfigured local device must keep the validated legacy default"
+        );
     }
 
     #[test]
