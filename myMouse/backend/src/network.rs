@@ -148,6 +148,8 @@ struct InboundFrame {
     key: PeerKey,
     generation: u64,
     peer_device_id: String,
+    /// Fingerprint of the client certificate presented on an accepted stream.
+    peer_fingerprint: Option<String>,
     message: Message,
 }
 
@@ -1120,6 +1122,45 @@ impl PeerRuntime {
                     None => self.fail_transfer(&transfer_id, "unknown transfer"),
                 }
             }
+            // PairCode arrives only on a connection that already passed the
+            // pinned trusted-Hello gate. It can acknowledge an approved,
+            // peer-bound session, but it must never grant trust or a pin.
+            Message::PairCode { code } => {
+                let verdict = {
+                    let state = self.state.lock().unwrap();
+                    let sessions_result = state.pairing_sessions.lock();
+                    match sessions_result {
+                        Ok(mut sessions) => match sessions.get_mut(&code) {
+                            Some(session) => {
+                                let presented_fingerprint =
+                                    frame.peer_fingerprint.as_deref().unwrap_or("");
+                                if session.matches(&code)
+                                    && session.is_bound_to(
+                                        &frame.peer_device_id,
+                                        presented_fingerprint,
+                                    )
+                                    && session.approved()
+                                    && session.consume()
+                                {
+                                    Message::PairApprove
+                                } else {
+                                    Message::PairReject
+                                }
+                            }
+                            None => Message::PairReject,
+                        },
+                        Err(_) => Message::PairReject,
+                    }
+                };
+                if verdict == Message::PairApprove {
+                    let state = self.state.lock().unwrap();
+                    let sessions_result = state.pairing_sessions.lock();
+                    if let Ok(mut sessions) = sessions_result {
+                        sessions.remove(&code);
+                    }
+                }
+                self.send_to(frame.key, verdict);
+            }
             Message::InputEvent { target, payload } => {
                 let payload_bytes = payload.len();
                 let Some(event) = decode_captured_event(&payload) else {
@@ -1226,6 +1267,7 @@ fn spawn_connection(
     command_tx: mpsc::UnboundedSender<RuntimeCommand>,
 ) -> (mpsc::UnboundedSender<OutgoingFrame>, Vec<JoinHandle<()>>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
+    let peer_fingerprint = stream.peer_fingerprint().map(str::to_string);
     let (mut reader, mut writer) = stream.into_split();
 
     let read_tx = inbound_tx.clone();
@@ -1240,6 +1282,7 @@ fn spawn_connection(
                             key,
                             generation,
                             peer_device_id: read_peer_id.clone(),
+                            peer_fingerprint: peer_fingerprint.clone(),
                             message,
                         })
                         .is_err()
@@ -1458,6 +1501,104 @@ mod tests {
         (runtime, peer_connected, active_peer_id)
     }
 
+    fn pairing_reply(rx: &mut mpsc::UnboundedReceiver<OutgoingFrame>) -> Message {
+        let frame = rx.try_recv().expect("the peer must receive one pairing verdict");
+        assert!(rx.try_recv().is_err(), "a pairing attempt must produce exactly one verdict");
+        frame.message
+    }
+
+    #[test]
+    fn pair_code_requires_bound_authenticated_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let bound_fingerprint = "a".repeat(64);
+        let presented_fingerprint = "b".repeat(64);
+        let code = {
+            let st = state.lock().unwrap();
+            let mut session = crate::pairing::PairSession::new("pc-a");
+            let _ = session.bind_peer("pc-b", &bound_fingerprint);
+            assert!(session.approve(), "the negative case must isolate the peer mismatch");
+            let code = session.code().to_string();
+            st.pairing_sessions.lock().unwrap().insert(code.clone(), session);
+            code
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut runtime, _connected, _active) = test_runtime(state.clone());
+        runtime.connections.insert(
+            PeerKey::Accepted(4),
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 4,
+                peer_device_id: "pc-c".into(),
+            },
+        );
+
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Accepted(4),
+            generation: 4,
+            peer_device_id: "pc-c".into(),
+            peer_fingerprint: Some(presented_fingerprint),
+            message: Message::PairCode { code },
+        });
+
+        assert_eq!(pairing_reply(&mut rx), Message::PairReject);
+        let st = state.lock().unwrap();
+        assert!(!st.trust.is_trusted("pc-b"), "a rejected code must not grant trust");
+        assert!(!st.trust.is_trusted("pc-c"), "a rejected code must not grant trust");
+    }
+
+    #[test]
+    fn pair_code_from_approved_bound_peer_is_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let bound_fingerprint = "a".repeat(64);
+        let code = {
+            let st = state.lock().unwrap();
+            let mut session = crate::pairing::PairSession::new("pc-a");
+            let _ = session.bind_peer("pc-b", &bound_fingerprint);
+            assert!(session.approve());
+            let code = session.code().to_string();
+            st.pairing_sessions.lock().unwrap().insert(code.clone(), session);
+            code
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut runtime, _connected, _active) = test_runtime(state.clone());
+        runtime.connections.insert(
+            PeerKey::Accepted(5),
+            Connection {
+                tx,
+                tasks: Vec::new(),
+                generation: 5,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+
+        runtime.dispatch(InboundFrame {
+            key: PeerKey::Accepted(5),
+            generation: 5,
+            peer_device_id: "pc-b".into(),
+            // Case-insensitive comparison must accept the same pinned cert.
+            peer_fingerprint: Some(bound_fingerprint.to_ascii_uppercase()),
+            message: Message::PairCode { code: code.clone() },
+        });
+
+        assert_eq!(pairing_reply(&mut rx), Message::PairApprove);
+        let st = state.lock().unwrap();
+        assert!(
+            !st.trust.is_trusted("pc-b"),
+            "a code acknowledgement alone must not persist trust"
+        );
+        assert!(
+            st.pairing_sessions.lock().unwrap().get(&code).is_none(),
+            "the one-time session must be consumed after acknowledgement"
+        );
+    }
+
     #[test]
     fn liveness_expires_after_timeout() {
         let last = Instant::now();
@@ -1588,6 +1729,7 @@ mod tests {
             key: PeerKey::Outbound,
             generation: 1,
             peer_device_id: "pc-b".into(),
+            peer_fingerprint: None,
             message: Message::FileTransferAccept {
                 transfer_id: offer.transfer_id,
             },
@@ -1668,6 +1810,7 @@ mod tests {
             key: PeerKey::Outbound,
             generation: 1,
             peer_device_id: "pc-b".into(),
+            peer_fingerprint: None,
             message: Message::FileTransferAccept {
                 transfer_id: offer.transfer_id.clone(),
             },
@@ -1754,6 +1897,7 @@ mod tests {
             key: PeerKey::Outbound,
             generation: 1,
             peer_device_id: "pc-b".into(),
+            peer_fingerprint: None,
             message: Message::FileTransferAccept {
                 transfer_id: offer.transfer_id.clone(),
             },
@@ -1803,6 +1947,7 @@ mod tests {
             key: PeerKey::Outbound,
             generation: 1,
             peer_device_id: "pc-b".into(),
+            peer_fingerprint: None,
             message: Message::FileTransferAccept {
                 transfer_id: offer.transfer_id.clone(),
             },
@@ -2180,6 +2325,7 @@ mod tests {
             key: PeerKey::Accepted(1),
             generation: 1,
             peer_device_id: "pc-b".into(),
+            peer_fingerprint: None,
             message: Message::FileTransferCancel {
                 transfer_id: offer.transfer_id.clone(),
                 reason: None,

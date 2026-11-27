@@ -109,6 +109,22 @@ describe('DeviceManagement discovered peers', () => {
     expect(await screen.findByText('Fingerprint does not match the discovered peer')).toBeInTheDocument();
   });
 
+  it('binds the QR pairing session to the verified joining peer', async () => {
+    const pairingUri = vi.fn(async () => 'mymouse://pair?code=123456&id=pc-a');
+    mockBridge({ pairingUri });
+
+    render(<DeviceManagement devices={[]} onRefresh={vi.fn(async () => {})} />);
+    expect(pairingUri).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('Pairing peer ID'), { target: { value: peer.id } });
+    fireEvent.change(screen.getByLabelText('Pairing peer fingerprint'), {
+      target: { value: fingerprint },
+    });
+    fireEvent.click(screen.getByLabelText('Verify joining peer fingerprint'));
+
+    await waitFor(() => expect(pairingUri).toHaveBeenCalledWith(peer.id, fingerprint));
+  });
+
   it('requires peer ID, exact fingerprint and verification before approving a pairing code', async () => {
     const approvePairing = vi.fn(async () => ({ ok: true }));
     mockBridge({ approvePairing });

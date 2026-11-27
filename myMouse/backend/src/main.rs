@@ -451,13 +451,29 @@ async fn handle_request(
             }
         }
         "pairingUri" => {
+            let peer_id = params.get("peerId").and_then(Value::as_str).unwrap_or("");
+            let fingerprint = params
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !is_valid_id(peer_id) {
+                return rpc_err(id, "invalid joining peer device id");
+            }
+            if !is_hex_fingerprint(fingerprint) {
+                return rpc_err(id, "fingerprint must be 64 hex characters");
+            }
             let st = state.lock().unwrap();
-            let session = pairing::PairSession::new(&st.device_id);
+            let mut session = pairing::PairSession::new(&st.device_id);
+            if !session.bind_peer(peer_id, fingerprint) {
+                return rpc_err(id, "could not bind the pairing session to the joining peer");
+            }
             let uri = session.pairing_uri();
             let code = session.code().to_string();
             if let Ok(mut sessions) = st.pairing_sessions.lock() {
                 sessions.insert(code, session);
-            };
+            } else {
+                return rpc_err(id, "pairing store unavailable");
+            }
             drop(st);
             rpc_ok(id, json!(uri));
         }
@@ -486,25 +502,30 @@ async fn handle_request(
                 let Some(session) = sessions.get_mut(code) else {
                     return rpc_err(id, "unknown or expired pairing code");
                 };
-                if !session.matches(code) || !session.approve() {
+                if !session.matches(code) {
                     return rpc_err(id, "invalid or already used pairing code");
                 }
-            }
-            // Consume the one-time session after a successful approval.
-            {
-                let st = state.lock().unwrap();
-                if let Ok(mut sessions) = st.pairing_sessions.lock() {
-                    sessions.remove(code);
-                };
+                if session.bound_peer_id() != Some(peer_id)
+                    || !session
+                        .bound_fingerprint()
+                        .is_some_and(|bound| bound.eq_ignore_ascii_case(fingerprint))
+                {
+                    return rpc_err(id, "peer does not match the pairing session");
+                }
+                if let Some(pinned) = st.trust.fingerprint(peer_id) {
+                    if !pinned.eq_ignore_ascii_case(fingerprint) {
+                        return rpc_err(id, "peer fingerprint changed; revoke the old device first");
+                    }
+                }
+                // Keep the approved session until the bound peer presents the
+                // code; PairCode consumption is the one-time acknowledgement.
+                if !session.approve() {
+                    return rpc_err(id, "invalid or already used pairing code");
+                }
             }
             let fingerprint = fingerprint.to_ascii_lowercase();
             {
                 let mut st = state.lock().unwrap();
-                if let Some(pinned) = st.trust.fingerprint(peer_id) {
-                    if !pinned.eq_ignore_ascii_case(&fingerprint) {
-                        return rpc_err(id, "peer fingerprint changed; revoke the old device first");
-                    }
-                }
                 st.trust.grant_if_absent(
                     peer_id,
                     Capabilities {
@@ -1427,5 +1448,114 @@ mod tests {
             .unwrap();
         let mut rejected_data = server.accept().await.unwrap();
         assert!(gate_inbound_stream(&state, &mut rejected_data).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn approve_pairing_rejects_peer_id_outside_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(dir.path().to_path_buf()).unwrap()));
+        let bound_fingerprint = "a".repeat(64);
+        let other_fingerprint = "b".repeat(64);
+        let code = {
+            let st = state.lock().unwrap();
+            let mut session = pairing::PairSession::new(&st.device_id);
+            let _ = session.bind_peer("pc-b", &bound_fingerprint);
+            let code = session.code().to_string();
+            st.pairing_sessions.lock().unwrap().insert(code.clone(), session);
+            code
+        };
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        handle_request(
+            &state,
+            &network,
+            17,
+            &json!({
+                "method": "approvePairing",
+                "params": {
+                    "code": code,
+                    "peerId": "pc-c",
+                    "fingerprint": other_fingerprint,
+                    "verified": true,
+                }
+            }),
+        )
+        .await;
+
+        {
+            let st = state.lock().unwrap();
+            assert!(
+                !st.trust.is_trusted("pc-c"),
+                "a peer outside the session must not gain trust"
+            );
+            let sessions = st.pairing_sessions.lock().unwrap();
+            let session = sessions
+                .get(&code)
+                .expect("a rejected approval must not consume the session");
+            assert!(!session.approved(), "a mismatched peer must not approve the session");
+        }
+        shutdown_runtime(&network, || {});
+    }
+
+    #[tokio::test]
+    async fn approve_pairing_accepts_the_bound_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(dir.path().to_path_buf()).unwrap()));
+        let fingerprint = "A".repeat(64);
+        let code = {
+            let st = state.lock().unwrap();
+            let mut session = pairing::PairSession::new(&st.device_id);
+            let _ = session.bind_peer("pc-b", &fingerprint);
+            let code = session.code().to_string();
+            st.pairing_sessions.lock().unwrap().insert(code.clone(), session);
+            code
+        };
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        handle_request(
+            &state,
+            &network,
+            18,
+            &json!({
+                "method": "approvePairing",
+                "params": {
+                    "code": code,
+                    "peerId": "pc-b",
+                    "fingerprint": fingerprint,
+                    "verified": true,
+                }
+            }),
+        )
+        .await;
+
+        {
+            let st = state.lock().unwrap();
+            assert!(st.trust.is_trusted("pc-b"), "the bound peer must gain trust");
+            assert_eq!(
+                st.trust.fingerprint("pc-b"),
+                Some(fingerprint.to_ascii_lowercase().as_str()),
+                "the verified fingerprint must be pinned"
+            );
+            let sessions = st.pairing_sessions.lock().unwrap();
+            assert!(
+                sessions.get(&code).is_some_and(|session| session.approved()),
+                "the approved session must remain available for the PairCode acknowledgement"
+            );
+        }
+        shutdown_runtime(&network, || {});
     }
 }

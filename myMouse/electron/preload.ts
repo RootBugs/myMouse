@@ -3,7 +3,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 contextBridge.exposeInMainWorld('mymouse', {
   status: () => ipcRenderer.invoke('mymouse:call', 'status'),
   devices: () => ipcRenderer.invoke('mymouse:call', 'devices'),
-  pairingUri: () => ipcRenderer.invoke('mymouse:call', 'pairingUri'),
+  pairingUri: (peerId: string, fingerprint: string) =>
+    ipcRenderer.invoke('mymouse:call', 'pairingUri', { peerId, fingerprint }),
   approvePairing: (code: string, peerId: string, fingerprint: string, verified: boolean) =>
     ipcRenderer.invoke('mymouse:call', 'approvePairing', { code, peerId, fingerprint, verified }),
   setLayout: (layout: unknown) => ipcRenderer.invoke('mymouse:call', 'setLayout', { layout }),

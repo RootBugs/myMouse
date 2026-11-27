@@ -77,7 +77,7 @@ declare global {
     mymouse: {
       status: () => Promise<{ ok: boolean; connected: boolean; deviceId?: string }>;
       devices: () => Promise<TrustedDevice[]>;
-      pairingUri: () => Promise<string>;
+      pairingUri: (peerId: string, fingerprint: string) => Promise<string>;
       approvePairing: (code: string, peerId: string, fingerprint: string, verified: boolean) =>
         Promise<{ ok: boolean; error?: string }>;
       setLayout: (layout: DeviceLayoutData) => Promise<{ ok: boolean; error?: string }>;

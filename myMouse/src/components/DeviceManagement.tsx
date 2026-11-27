@@ -51,13 +51,34 @@ export default function DeviceManagement({ devices, onRefresh }: Props) {
   }, []);
 
   useEffect(() => {
-    window.mymouse.pairingUri().then(setUri).catch(() => setUri(''));
     void refreshPeers();
     const unsubscribe = window.mymouse.onNotification?.((message) => {
       if (message.notification === 'discoveredPeer') void refreshPeers();
     });
     return () => unsubscribe?.();
   }, [refreshPeers]);
+
+  // The pairing session must be created for the exact joining peer whose
+  // fingerprint the user verified, otherwise the code could be approved for
+  // a different device later.
+  useEffect(() => {
+    if (!isPeerId(approvePeerId) || !isFingerprint(approveFingerprint) || !approveVerified) {
+      setUri('');
+      return undefined;
+    }
+    let cancelled = false;
+    window.mymouse
+      .pairingUri(approvePeerId.trim(), approveFingerprint.trim())
+      .then((nextUri) => {
+        if (!cancelled) setUri(nextUri);
+      })
+      .catch(() => {
+        if (!cancelled) setUri('');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [approvePeerId, approveFingerprint, approveVerified]);
 
   const confirmationFor = (peerId: string): FingerprintConfirmation =>
     confirmations[peerId] ?? { fingerprint: '', verified: false };
