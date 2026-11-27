@@ -32,9 +32,10 @@ Last accuracy pass: 2026-11-27. Scope statements below distinguish what was
   two-instance harness still uses a synthetic crossing over pinned TLS.
 - **Peer liveness is implemented and unit-tested, not physically tested.** The
   runtime sends a v2 `Status` heartbeat once per second on the active
-  connection. More than three seconds without a live peer frame releases tracked
-  injected keys/buttons once and emits `inputLost`; fresh frames reset the
-  latch. The watchdog does not write `input_gate`, so emergency stop remains
+  connection. More than three seconds without a live frame from the peer that
+  supplied input releases tracked injected keys/buttons once and emits
+  `inputLost`; other peers' frames do not mask that silence, and fresh frames
+  from the source reset the latch. The watchdog does not write `input_gate`, so emergency stop remains
   authoritative. The tracker/timeout state transitions are unit-tested, but the
   actual Windows `SendInput` key-up/button-up effects and a real Wi-Fi/peer
   interruption were not hardware-verified.

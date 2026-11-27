@@ -90,19 +90,22 @@ unit-tested and wired**; both **not physically tested**.
   [benchmarks.md](benchmarks.md). It is a **two-process loopback harness** on
   one Windows host: not field latency, not a physical two-PC session, and not a
   comparison with any upstream product.
-- Measured values on this host: input delivery 11.72 ms, clipboard 15.383
-  Mbit/s, file 14.925 Mbit/s, cold pinned-TLS connect 116.5 ms, idle CPU 0% on
-  both processes, idle RAM 12.02/11.77 MiB. Reconnect after peer loss is
+- Measured values on this host: input delivery 25.31 ms, clipboard 7.019
+  Mbit/s, file 6.966 Mbit/s, cold pinned-TLS connect 236.6 ms, idle CPU 0% on
+  both processes, idle RAM 12.12/11.82 MiB. Reconnect after peer loss is
   deliberately `null`/unmeasured because test mode has no auto-reconnect loop.
 - Benchmarking exposed a real production bug: file transfers above one 256 KiB
   chunk stalled after the first chunk. The regression test
   `accept_sends_every_chunk_for_large_file` went red → green, and the 1 MiB
   benchmark now observes a genuinely completed transfer.
 - The liveness watchdog reuses v2 `Status` as a one-second heartbeat. After more
-  than three seconds without a live peer frame, tracked injected keys/buttons
-  are released once and `inputLost` is emitted when held input existed. The
-  tracker, timeout boundary and one-shot latch are unit-tested. The watchdog
-  never writes `input_gate`, so emergency stop remains authoritative.
+  than three seconds without a live frame from the peer that supplied input,
+  tracked injected keys/buttons are released once and `inputLost` is emitted
+  when held input existed. Frames from a different peer do not mask that
+  silence. The tracker, timeout boundary, one-shot latch, heartbeat target and
+  gate preservation are unit-tested. The watchdog never writes `input_gate`, so
+  emergency stop remains authoritative. Large file chunks are now pumped one
+  event-loop turn at a time, and both quit and IPC-EOF release injected input.
 - Windows `SendInput` release effects and a physical silent-peer/held-key
   interruption were **not** hardware-audited. No superiority or field-latency
   claim follows from this increment.
@@ -131,7 +134,7 @@ Commands were run from `myMouse/` unless noted.
 
 | Command | Result |
 | --- | --- |
-| `cargo test` in `myMouse/backend` | `73 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
+| `cargo test` in `myMouse/backend` | `77 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
 | `cargo test` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
 | `npm test -- --run` | `5 files / 19 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
 | `npm run build` | exit 0; Vite produced `index.html`, CSS, and JS assets; Electron TypeScript build succeeded |

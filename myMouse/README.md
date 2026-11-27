@@ -21,7 +21,8 @@ Those numbers are harness values on one host — not field latency, not a
 physical two-PC session, and not a comparison with any upstream product.
 The peer-liveness watchdog is implemented and unit-tested: it sends one v2
 `Status` heartbeat per second, releases held injected input after more than
-three seconds without a live peer frame, and emits `inputLost`. Hardware-level
+three seconds without a live frame from the peer that supplied that input, and
+emits `inputLost`. Hardware-level
 `SendInput` release and a real silent-peer interruption remain untested.
 
 Android (`apps/android/`) and the Rust FFI crate (`shared/android-bridge/`) are
@@ -186,9 +187,10 @@ it, it will require your explicit action.
 - Only one input source is active at a time. Injected events are filtered from
   capture so control cannot loop back.
 - **Peer liveness:** the runtime sends one v2 `Status` heartbeat per second on
-  the active connection. More than three seconds without a live peer frame
-  releases any injected keys or buttons once and emits `inputLost`. A fresh
-  peer frame clears the latch. The watchdog never writes the injection gate;
+  the active connection. More than three seconds without a live frame from the
+  peer that supplied input releases that injected input once and emits
+  `inputLost`. Frames from other peers do not mask the silent source, and a
+  fresh frame from the source clears the latch. The watchdog never writes the injection gate;
   Escape/local stop and emergency pause remain authoritative. Tracker and
   timeout behaviour is unit-tested; actual `SendInput` release is not
   hardware-audited.

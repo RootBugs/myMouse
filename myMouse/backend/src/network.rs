@@ -133,6 +133,11 @@ enum RuntimeCommand {
         ack: oneshot::Sender<Result<(), String>>,
     },
     ConnectionClosed { key: PeerKey, generation: u64 },
+    /// Generate and queue exactly one more outgoing file chunk. Re-queuing
+    /// through the command channel lets the runtime service heartbeats, inbound
+    /// frames and cancellation between chunks instead of blocking on a full
+    /// file-sized synchronous drain.
+    PumpFileTransfer { transfer_id: String, peer: PeerKey },
     Status {
         ack: oneshot::Sender<bool>,
     },
@@ -343,8 +348,13 @@ struct PeerRuntime {
     active_peer_id: Arc<Mutex<Option<String>>>,
     last_input_window: Instant,
     input_events_in_window: usize,
-    last_peer_frame: Instant,
-    watchdog_notified: bool,
+    /// Most recent live frame from each peer, keyed by device ID. Liveness must
+    /// be judged against the peer that injected input, not any connected peer.
+    last_peer_frames: HashMap<String, Instant>,
+    /// Peer whose input is currently held on this machine, if any.
+    input_source: Option<String>,
+    /// Peer whose silence has already triggered a release in this episode.
+    watchdog_notified_for: Option<String>,
 }
 
 impl PeerRuntime {
@@ -385,8 +395,9 @@ impl PeerRuntime {
                 active_peer_id,
                 last_input_window: Instant::now(),
                 input_events_in_window: 0,
-                last_peer_frame: Instant::now(),
-                watchdog_notified: false,
+                last_peer_frames: HashMap::new(),
+                input_source: None,
+                watchdog_notified_for: None,
             };
             runtime.run().await;
         });
@@ -437,15 +448,22 @@ impl PeerRuntime {
         }
     }
 
-    /// Detect a silent peer and release injected input at most once per silent
-    /// episode. Never re-enables injection: `input_gate` is deliberately not
-    /// read or written here.
+    /// Detect a silent input source and release injected input at most once per
+    /// silent episode. Frames from unrelated peers do not count as proof of
+    /// life for this source. Never re-enables injection: `input_gate` is
+    /// deliberately not read or written here.
     fn check_liveness(&mut self, now: Instant) -> bool {
-        if !liveness_expires(self.last_peer_frame, now, INPUT_WATCHDOG_TIMEOUT) {
-            self.watchdog_notified = false;
+        let Some(source) = self.input_source.clone() else {
+            return false;
+        };
+        let Some(last) = self.last_peer_frames.get(&source).copied() else {
+            return false;
+        };
+        if !liveness_expires(last, now, INPUT_WATCHDOG_TIMEOUT) {
+            self.watchdog_notified_for = None;
             return false;
         }
-        if self.watchdog_notified {
+        if self.watchdog_notified_for.as_deref() == Some(source.as_str()) {
             return false;
         }
         let held_input = InputBridge::release_all_injected();
@@ -455,7 +473,7 @@ impl PeerRuntime {
                 "reason": "peer heartbeat timeout",
             }));
         }
-        self.watchdog_notified = true;
+        self.watchdog_notified_for = Some(source);
         true
     }
 
@@ -601,6 +619,24 @@ impl PeerRuntime {
                 }
                 let _ = ack.send(Ok(()));
             }
+            RuntimeCommand::PumpFileTransfer { transfer_id, peer } => {
+                if !self.connections.contains_key(&peer) {
+                    return;
+                }
+                let next = {
+                    let mut state = self.state.lock().unwrap();
+                    state
+                        .transfers
+                        .next_chunks(&transfer_id, crate::file_transfer::DEFAULT_CHUNK_BYTES)
+                };
+                match next {
+                    Ok(messages) if messages.is_empty() => {
+                        emit_transfer_failure(&transfer_id, "transfer produced no chunks");
+                    }
+                    Ok(messages) => self.queue_transfer_step(&transfer_id, peer, messages),
+                    Err(error) => emit_transfer_failure(&transfer_id, &error.to_string()),
+                }
+            }
             RuntimeCommand::ConnectionClosed { key, generation } => {
                 // A stale reader must never remove the replacement connection.
                 let stale_outbound = matches!(key, PeerKey::Outbound)
@@ -654,6 +690,50 @@ impl PeerRuntime {
         }
     }
 
+    /// Emit history, send one step of an outgoing transfer, and only then ask
+    /// the runtime for the next turn. This keeps a large transfer from blocking
+    /// heartbeat and command processing.
+    fn queue_transfer_step(&mut self, transfer_id: &str, peer: PeerKey, messages: Vec<Message>) {
+        let completed = messages
+            .iter()
+            .any(|message| matches!(message, Message::FileTransferComplete { .. }));
+        {
+            let record = {
+                let state = self.state.lock().unwrap();
+                state
+                    .transfers
+                    .history()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.transfer_id == transfer_id)
+                    .cloned()
+            };
+            if let Some(record) = record {
+                emit_transfer_record(&record);
+            }
+        }
+        for message in messages {
+            self.send_to(peer, message);
+        }
+        if completed {
+            let record = {
+                let mut state = self.state.lock().unwrap();
+                state.transfers.mark_outgoing_complete(transfer_id)
+            };
+            if let Some(record) = record {
+                emit_transfer_record(&record);
+            }
+            return;
+        }
+        // Do not keep generating chunks after the peer connection is gone.
+        if self.connections.contains_key(&peer) {
+            let _ = self.command_sender.send(RuntimeCommand::PumpFileTransfer {
+                transfer_id: transfer_id.to_string(),
+                peer,
+            });
+        }
+    }
+
     fn dispatch(&mut self, frame: InboundFrame) {
         // Frames from a replaced outbound connection are discarded even if
         // its reader was still draining buffered data.
@@ -662,10 +742,16 @@ impl PeerRuntime {
         {
             return;
         }
-        // Any live peer frame is proof of life, including capability-rejected
-        // frames and Status heartbeats. Stale frames from a replaced connection
-        // are already dropped above and must not keep the watchdog asleep.
-        self.last_peer_frame = Instant::now();
+        // Any live frame from a peer is proof of life for that peer, including
+        // capability-rejected frames and Status heartbeats. Stale frames from a
+        // replaced connection are already dropped above. Liveness is later
+        // judged against the peer that actually injected input, so another
+        // peer's traffic cannot mask the silence we care about.
+        let peer_id = frame.peer_device_id.clone();
+        self.last_peer_frames.insert(peer_id.clone(), Instant::now());
+        if self.watchdog_notified_for.as_deref() == Some(peer_id.as_str()) {
+            self.watchdog_notified_for = None;
+        }
         let capabilities = {
             let state = self.state.lock().unwrap();
             state
@@ -735,73 +821,7 @@ impl PeerRuntime {
                     state.transfers.handle_accept(&transfer_id)
                 };
                 match result {
-                    Ok(messages) => {
-                        // handle_accept returns exactly one chunk by design. Keep
-                        // draining the sender until the final chunk and its
-                        // completion frame are queued, or larger files stall.
-                        let mut messages = messages;
-                        let mut completed = messages.iter().any(|m| {
-                            matches!(m, Message::FileTransferComplete { .. })
-                        });
-                        loop {
-                            if completed {
-                                break;
-                            }
-                            let next = {
-                                let mut state = self.state.lock().unwrap();
-                                state
-                                    .transfers
-                                    .next_chunks(&transfer_id, crate::file_transfer::DEFAULT_CHUNK_BYTES)
-                            };
-                            match next {
-                                Ok(next) if next.is_empty() => {
-                                    emit_transfer_failure(&transfer_id, "transfer produced no chunks");
-                                    break;
-                                }
-                                Ok(next) => {
-                                    completed = next.iter().any(|m| {
-                                        matches!(m, Message::FileTransferComplete { .. })
-                                    });
-                                    messages.extend(next);
-                                    if completed {
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    emit_transfer_failure(&transfer_id, &error.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        let record = {
-                            let state = self.state.lock().unwrap();
-                            state
-                                .transfers
-                                .history()
-                                .iter()
-                                .rev()
-                                .find(|entry| entry.transfer_id == transfer_id)
-                                .cloned()
-                        };
-                        if let Some(record) = record {
-                            emit_transfer_record(&record);
-                        }
-                        let completed = messages.iter().any(|m| {
-                            matches!(m, Message::FileTransferComplete { .. })
-                        });
-                        for message in messages {
-                            self.send_to(frame.key, message);
-                        }
-                        if completed {
-                            let record = {
-                                let mut state = self.state.lock().unwrap();
-                                state.transfers.mark_outgoing_complete(&transfer_id)
-                            };
-                            if let Some(record) = record {
-                                emit_transfer_record(&record);
-                            }
-                        }
-                    }
+                    Ok(messages) => self.queue_transfer_step(&transfer_id, frame.key, messages),
                     Err(error) => emit_transfer_failure(&transfer_id, &error.to_string()),
                 }
             }
@@ -896,6 +916,21 @@ impl PeerRuntime {
                     return;
                 }
                 self.input_events_in_window += 1;
+                // Only one peer may own injected input at a time. If a second
+                // trusted peer takes over, release the first peer's held keys
+                // instead of letting them outlive their source.
+                if self
+                    .input_source
+                    .as_deref()
+                    .is_some_and(|source| source != frame.peer_device_id)
+                    && InputBridge::release_all_injected()
+                {
+                    emit(json!({
+                        "notification": "inputLost",
+                        "reason": "input source changed",
+                    }));
+                }
+                self.input_source = Some(frame.peer_device_id.clone());
                 // Test mode still emits delivery notifications, but never
                 // touches the OS input stack.
                 if self.os_integration {
@@ -916,7 +951,7 @@ impl PeerRuntime {
                 }));
             }
             // Heartbeats carry no user-visible state; their arrival already
-            // refreshed `last_peer_frame` above.
+            // refreshed `last_peer_frames` above.
             Message::Status { .. } => {}
             other => {
                 emit(json!({
@@ -1097,8 +1132,9 @@ mod tests {
             active_peer_id: active_peer_id.clone(),
             last_input_window: Instant::now(),
             input_events_in_window: 0,
-            last_peer_frame: Instant::now(),
-            watchdog_notified: false,
+            last_peer_frames: HashMap::new(),
+            input_source: None,
+            watchdog_notified_for: None,
         };
         (runtime, peer_connected, active_peer_id)
     }
@@ -1130,14 +1166,78 @@ mod tests {
         let (mut runtime, _connected, _active) = test_runtime(state);
         let now = Instant::now();
 
-        runtime.last_peer_frame = now - Duration::from_secs(4);
-        runtime.watchdog_notified = false;
+        runtime.input_source = Some("pc-b".into());
+        runtime.last_peer_frames.insert("pc-b".into(), now - Duration::from_secs(4));
+        runtime.watchdog_notified_for = None;
+        runtime.input_gate.store(false, Ordering::SeqCst);
+
         assert!(runtime.check_liveness(now));
         assert!(!runtime.check_liveness(now));
+        assert!(!runtime.input_gate.load(Ordering::SeqCst), "watchdog must not reopen injection");
 
-        runtime.last_peer_frame = now;
+        runtime.last_peer_frames.insert("pc-b".into(), now);
         assert!(!runtime.check_liveness(now));
-        assert!(!runtime.watchdog_notified);
+        assert_eq!(runtime.watchdog_notified_for, None);
+    }
+
+    #[test]
+    fn silent_input_source_is_not_masked_by_another_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        let now = Instant::now();
+
+        runtime.input_source = Some("pc-a".into());
+        runtime.last_peer_frames.insert("pc-a".into(), now - Duration::from_secs(4));
+        runtime.last_peer_frames.insert("pc-b".into(), now);
+
+        assert!(
+            runtime.check_liveness(now),
+            "a different peer's heartbeat must not hide a silent input source"
+        );
+    }
+
+    #[test]
+    fn heartbeat_goes_only_to_the_active_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            crate::AppState::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let (mut runtime, _connected, active) = test_runtime(state);
+        let (inactive_tx, mut inactive_rx) = mpsc::unbounded_channel();
+        let (active_tx, mut active_rx) = mpsc::unbounded_channel();
+        runtime.connections.insert(
+            PeerKey::Accepted(1),
+            Connection {
+                tx: inactive_tx,
+                tasks: Vec::new(),
+                generation: 1,
+                peer_device_id: "pc-b".into(),
+            },
+        );
+        runtime.connections.insert(
+            PeerKey::Accepted(2),
+            Connection {
+                tx: active_tx,
+                tasks: Vec::new(),
+                generation: 2,
+                peer_device_id: "pc-c".into(),
+            },
+        );
+        *active.lock().unwrap() = Some("pc-c".into());
+
+        runtime.send_heartbeat();
+
+        assert!(inactive_rx.try_recv().is_err(), "heartbeat must not be broadcast");
+        let frame = active_rx.try_recv().expect("active peer should receive a heartbeat");
+        assert!(matches!(
+            frame.message,
+            Message::Status { connected: true, ref devices }
+                if devices == &vec!["pc-a".to_string()]
+        ));
+        assert!(active_rx.try_recv().is_err(), "one tick must produce exactly one heartbeat");
     }
 
     #[test]
@@ -1174,22 +1274,49 @@ mod tests {
             },
         });
 
-        let mut chunk_count = 0;
-        let mut chunk_bytes = 0usize;
-        let mut complete_count = 0;
-        while let Ok(frame) = rx.try_recv() {
-            match frame.message {
-                Message::FileTransferChunk(chunk) => {
-                    chunk_count += 1;
-                    chunk_bytes += chunk.data.len();
+        fn drain_outbound(
+            rx: &mut mpsc::UnboundedReceiver<OutgoingFrame>,
+            chunk_count: &mut usize,
+            chunk_bytes: &mut usize,
+            complete_count: &mut usize,
+        ) {
+            while let Ok(frame) = rx.try_recv() {
+                match frame.message {
+                    Message::FileTransferChunk(chunk) => {
+                        *chunk_count += 1;
+                        *chunk_bytes += chunk.data.len();
+                    }
+                    Message::FileTransferComplete { .. } => *complete_count += 1,
+                    _ => {}
                 }
-                Message::FileTransferComplete { .. } => complete_count += 1,
-                _ => {}
             }
         }
-        assert_eq!(chunk_count, 3, "all file chunks must be sent on accept");
-        assert_eq!(chunk_bytes, size, "all file bytes must be sent on accept");
-        assert_eq!(complete_count, 1, "transfer must complete on accept");
+
+        let mut chunk_count = 0usize;
+        let mut chunk_bytes = 0usize;
+        let mut complete_count = 0usize;
+
+        drain_outbound(&mut rx, &mut chunk_count, &mut chunk_bytes, &mut complete_count);
+        assert_eq!(chunk_count, 1, "accept must queue only the first chunk");
+        let first_pump = runtime.commands.try_recv();
+        assert!(
+            matches!(first_pump, Ok(RuntimeCommand::PumpFileTransfer { .. })),
+            "accept must enqueue an incremental pump, not block the runtime"
+        );
+
+        // Drive one event-loop turn at a time. Each pump may queue exactly one
+        // further chunk while heartbeats and commands keep running between turns.
+        if let Ok(command) = first_pump {
+            runtime.handle_command(command);
+            drain_outbound(&mut rx, &mut chunk_count, &mut chunk_bytes, &mut complete_count);
+        }
+        while let Ok(command) = runtime.commands.try_recv() {
+            runtime.handle_command(command);
+            drain_outbound(&mut rx, &mut chunk_count, &mut chunk_bytes, &mut complete_count);
+        }
+        assert_eq!(chunk_count, 3, "all file chunks must be sent by the pump");
+        assert_eq!(chunk_bytes, size, "all file bytes must be sent by the pump");
+        assert_eq!(complete_count, 1, "transfer must complete by the pump");
     }
 
     #[test]

@@ -242,6 +242,14 @@ fn hello_message(state: &Arc<Mutex<AppState>>) -> Message {
     }
 }
 
+/// Every production exit path releases remote-injected input before stopping
+/// the peer runtime. `release_modifiers` also drains the injected tracker on
+/// Windows and unconditionally lifts modifiers from older code paths.
+fn shutdown_runtime(network: &PeerRuntimeHandle, release_input: impl FnOnce()) {
+    release_input();
+    network.shutdown();
+}
+
 async fn handle_request(
     state: &Arc<Mutex<AppState>>,
     network: &PeerRuntimeHandle,
@@ -721,7 +729,9 @@ async fn handle_request(
             }
         }
         "quit" => {
-            network.shutdown();
+            shutdown_runtime(network, || {
+                InputBridge::release_modifiers();
+            });
             rpc_ok(id, json!({ "ok": true }));
             std::process::exit(0);
         }
@@ -962,7 +972,9 @@ async fn run_ipc() -> Result<(), String> {
         let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
         handle_request(&state, &network, id, &request).await;
     }
-    network.shutdown();
+    shutdown_runtime(&network, || {
+        InputBridge::release_modifiers();
+    });
     Ok(())
 }
 
@@ -1007,6 +1019,31 @@ mod tests {
     #[test]
     fn scaffold_compiles() {
         assert_eq!(env!("CARGO_PKG_NAME"), "mymouse-backend");
+    }
+
+    #[tokio::test]
+    async fn shutdown_helper_releases_input_before_stopping_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(dir.path().to_path_buf()).unwrap()));
+        let device_id = state.lock().unwrap().device_id.clone();
+        let handle = network::start(
+            state,
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let released = Arc::new(AtomicBool::new(false));
+        let marker = released.clone();
+        shutdown_runtime(&handle, || {
+            marker.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "every shutdown path must run input cleanup before stopping the runtime"
+        );
     }
 
     #[test]

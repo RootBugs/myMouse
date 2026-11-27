@@ -415,6 +415,15 @@ impl FileTransferManager {
             file.seek(SeekFrom::Start(outgoing.offset))?;
             let mut buf = vec![0u8; chunk_size.min((total - outgoing.offset) as usize)];
             let n = file.read(&mut buf)?;
+            if n == 0 && outgoing.offset < total {
+                // A shrinking or replaced file must fail the transfer. Returning
+                // an empty non-final chunk would leave the offset unchanged and
+                // let the sender's pump loop spin forever with no progress.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file ended before the advertised size",
+                ));
+            }
             buf.truncate(n);
             let offset = outgoing.offset;
             outgoing.offset += n as u64;
@@ -674,6 +683,36 @@ mod tests {
         let record = mgr.history().first().expect("history should contain the transfer");
         assert_eq!(record.state, TransferState::Accepted);
         assert!(dir.path().join("note.txt.manual-1.part").exists());
+    }
+
+    #[test]
+    fn truncated_offer_fails_instead_of_emitting_an_empty_chunk() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("changing.bin");
+        fs::write(&src, vec![7u8; 64]).unwrap();
+
+        let mut sender = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: true,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        let (offer, _) = sender.create_offer(&src, "pc-b").unwrap();
+
+        // The file shrinks after the offer advertised 64 bytes. The next read
+        // after the surviving 8 bytes must fail, not return a zero-length
+        // chunk that leaves the offset unchanged forever.
+        fs::write(&src, vec![7u8; 8]).unwrap();
+        let first = sender.handle_accept(&offer.transfer_id).unwrap();
+        assert!(!first.iter().any(|m| matches!(m, Message::FileTransferComplete { .. })));
+
+        let second = sender.next_chunks(&offer.transfer_id, 64);
+        assert!(
+            matches!(second, Err(ref error) if error.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {second:?}"
+        );
     }
 
     #[test]
