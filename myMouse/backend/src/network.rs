@@ -180,7 +180,11 @@ enum RuntimeCommand {
         peer_device_id: String,
         ack: oneshot::Sender<Result<(), String>>,
     },
-    ConnectionClosed { key: PeerKey, generation: u64 },
+    ConnectionClosed {
+        key: PeerKey,
+        generation: u64,
+        peer_device_id: String,
+    },
     /// Generate and queue exactly one more outgoing file chunk. Re-queuing
     /// through the command channel lets the runtime service heartbeats, inbound
     /// frames and cancellation between chunks instead of blocking on a full
@@ -583,6 +587,7 @@ impl PeerRuntime {
                         }
                     }
                 }
+                self.fail_peer_records(&peer_device_id);
                 self.refresh_active_peer();
                 let _ = ack.send(());
             }
@@ -702,7 +707,11 @@ impl PeerRuntime {
                     Err(error) => self.fail_transfer(&transfer_id, &error.to_string()),
                 }
             }
-            RuntimeCommand::ConnectionClosed { key, generation } => {
+            RuntimeCommand::ConnectionClosed {
+                key,
+                generation,
+                peer_device_id,
+            } => {
                 // A stale reader must never remove the replacement connection.
                 let stale_outbound = matches!(key, PeerKey::Outbound)
                     && generation != self.active_outbound_generation;
@@ -713,6 +722,11 @@ impl PeerRuntime {
                         }
                     }
                     self.refresh_active_peer();
+                }
+                // Only terminalize when this peer has no live replacement; a
+                // same-peer reconnect keeps its new transfers alive.
+                if peer_keys_for_device(&self.connections, &peer_device_id).is_empty() {
+                    self.fail_peer_records(&peer_device_id);
                 }
             }
             RuntimeCommand::Status { ack } => {
@@ -733,8 +747,6 @@ impl PeerRuntime {
         if self.connections.is_empty() {
             self.peer_connected.store(false, Ordering::SeqCst);
             *self.active_peer_id.lock().unwrap() = None;
-            let mut state = self.state.lock().unwrap();
-            state.transfers.cleanup_disconnected_peer();
         } else {
             self.peer_connected.store(true, Ordering::SeqCst);
             let next = self
@@ -766,6 +778,16 @@ impl PeerRuntime {
             emit_transfer_record(&record);
         } else {
             emit_transfer_failure(transfer_id, message);
+        }
+    }
+
+    fn fail_peer_records(&mut self, peer_device_id: &str) {
+        let records = {
+            let mut state = self.state.lock().unwrap();
+            state.transfers.fail_peer_transfers(peer_device_id)
+        };
+        for record in records {
+            emit_transfer_record(&record);
         }
     }
 
@@ -1144,7 +1166,11 @@ fn spawn_connection(
                 }
             }
         }
-        let _ = read_commands.send(RuntimeCommand::ConnectionClosed { key, generation });
+        let _ = read_commands.send(RuntimeCommand::ConnectionClosed {
+            key,
+            generation,
+            peer_device_id: read_peer_id.clone(),
+        });
     });
 
     let writer_task = tokio::spawn(async move {
@@ -1674,6 +1700,81 @@ mod tests {
         assert!(runtime.connections.is_empty());
         assert!(!peer_connected.load(Ordering::SeqCst));
         assert!(active_peer_id.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn disconnect_terminalizes_only_that_peers_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::AppState::new(dir.path().to_path_buf()).unwrap();
+        app.transfers.set_settings(crate::file_transfer::FileTransferSettings {
+            auto_accept: false,
+            save_dir: dir.path().to_string_lossy().to_string(),
+            max_transfer_bytes: 1024 * 1024,
+        });
+        app.trust.grant("pc-b", caps());
+        app.trust.grant("pc-c", caps());
+        app.transfers.handle_offer(
+            mymouse_protocol::FileOffer {
+                transfer_id: "from-b".into(),
+                from_device_id: "pc-b".into(),
+                name: "b.txt".into(),
+                size: 4,
+                sha256: "x".into(),
+                mime: None,
+            },
+            "pc-b",
+        );
+        app.transfers.handle_offer(
+            mymouse_protocol::FileOffer {
+                transfer_id: "from-c".into(),
+                from_device_id: "pc-c".into(),
+                name: "c.txt".into(),
+                size: 4,
+                sha256: "x".into(),
+                mime: None,
+            },
+            "pc-c",
+        );
+        app.transfers.accept("from-b").unwrap();
+        app.transfers.accept("from-c").unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (mut runtime, _connected, _active) = test_runtime(state);
+        for (key, peer) in [(PeerKey::Accepted(0), "pc-b"), (PeerKey::Accepted(1), "pc-c")] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            runtime.connections.insert(
+                key,
+                Connection {
+                    tx,
+                    tasks: Vec::new(),
+                    generation: 1,
+                    peer_device_id: peer.into(),
+                },
+            );
+        }
+
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        runtime.handle_command(RuntimeCommand::DisconnectPeer {
+            peer_device_id: "pc-b".into(),
+            ack: ack_tx,
+        });
+
+        let state = runtime.state.lock().unwrap();
+        let b = state
+            .transfers
+            .history()
+            .iter()
+            .find(|entry| entry.transfer_id == "from-b")
+            .unwrap();
+        assert_eq!(b.state, crate::file_transfer::TransferState::Cancelled);
+        assert!(!dir.path().join("b.txt.from-b.part").exists());
+        let c = state
+            .transfers
+            .history()
+            .iter()
+            .find(|entry| entry.transfer_id == "from-c")
+            .unwrap();
+        assert_eq!(c.state, crate::file_transfer::TransferState::Accepted);
+        assert!(dir.path().join("c.txt.from-c.part").exists());
     }
 
     #[tokio::test]

@@ -278,6 +278,16 @@ impl FileTransferManager {
                 reason: Some("invalid transfer id".into()),
             }];
         }
+        // A transfer id identifies one record. Reusing an active id must not
+        // let another peer overwrite the original direction or history entry.
+        if self.incoming.contains_key(&offer.transfer_id)
+            || self.outgoing.contains_key(&offer.transfer_id)
+        {
+            return vec![Message::FileTransferReject {
+                transfer_id: offer.transfer_id,
+                reason: Some("duplicate transfer id".into()),
+            }];
+        }
         if offer.size > self.settings.max_transfer_bytes {
             let record = TransferRecord {
                 transfer_id: offer.transfer_id.clone(),
@@ -488,7 +498,26 @@ impl FileTransferManager {
                 "chunk exceeds declared size",
             ));
         }
-        if chunk.offset != incoming.record.bytes_transferred {
+        let part_path = incoming.part_path.clone();
+        if chunk.offset < incoming.record.bytes_transferred {
+            // A retransmitted chunk is safe only when the bytes already on disk
+            // match exactly; conflicting bytes indicate a corrupted or hostile
+            // sender and must fail the transfer instead of being silently kept.
+            let mut existing_file = File::open(&part_path)?;
+            let mut existing = vec![0u8; chunk.data.len()];
+            existing_file.seek(SeekFrom::Start(chunk.offset))?;
+            let read = existing_file.read(&mut existing)?;
+            if read != chunk.data.len() || existing != chunk.data {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk conflicts with already written bytes",
+                ));
+            }
+            let record = incoming.record.clone();
+            self.push_history(record.clone());
+            return Ok(Some(record));
+        }
+        if chunk.offset > incoming.record.bytes_transferred {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "chunk is out of sequence",
@@ -496,7 +525,7 @@ impl FileTransferManager {
         }
         let mut file = OpenOptions::new()
             .write(true)
-            .open(&incoming.part_path)?;
+            .open(&part_path)?;
         file.seek(SeekFrom::Start(chunk.offset))?;
         file.write_all(&chunk.data)?;
         incoming.record.bytes_transferred = end;
@@ -672,6 +701,45 @@ impl FileTransferManager {
 
     /// Remove every partial file left by a disconnected peer. History is kept
     /// so the user can still see that a transfer was interrupted.
+    /// Terminalize only the named peer's active transfers. Other peers remain
+    /// usable, and history keeps a record of every interrupted transfer.
+    pub fn fail_peer_transfers(&mut self, peer_device_id: &str) -> Vec<TransferRecord> {
+        let mut failed = Vec::new();
+        let incoming_ids: Vec<TransferId> = self
+            .incoming
+            .iter()
+            .filter(|(_, transfer)| transfer.record.peer_device_id == peer_device_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for transfer_id in incoming_ids {
+            if let Some(mut transfer) = self.incoming.remove(&transfer_id) {
+                let _ = fs::remove_file(&transfer.part_path);
+                transfer.record.state = TransferState::Cancelled;
+                transfer.record.message = Some("peer disconnected".into());
+                transfer.record.updated_at_ms = now_ms();
+                self.push_history(transfer.record.clone());
+                failed.push(transfer.record);
+            }
+        }
+
+        let outgoing_ids: Vec<TransferId> = self
+            .outgoing
+            .iter()
+            .filter(|(_, transfer)| transfer.record.peer_device_id == peer_device_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for transfer_id in outgoing_ids {
+            if let Some(mut transfer) = self.outgoing.remove(&transfer_id) {
+                transfer.record.state = TransferState::Cancelled;
+                transfer.record.message = Some("peer disconnected".into());
+                transfer.record.updated_at_ms = now_ms();
+                self.push_history(transfer.record.clone());
+                failed.push(transfer.record);
+            }
+        }
+        failed
+    }
+
     pub fn cleanup_disconnected_peer(&mut self) {
         let interrupted: Vec<IncomingTransfer> = self.incoming.drain().map(|(_, entry)| entry).collect();
         for mut incoming in interrupted {
@@ -1021,5 +1089,108 @@ mod tests {
         assert!(mgr.owns_incoming("incoming-1", "pc-c"));
         assert!(!mgr.owns_incoming("incoming-1", "pc-b"));
         assert!(!mgr.owns_outgoing("incoming-1", "pc-c"));
+    }
+
+    #[test]
+    fn duplicate_offer_id_is_rejected() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, b"hello").unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        let (offer, _) = mgr.create_offer(&source, "pc-b").unwrap();
+        let duplicate = FileOffer {
+            transfer_id: offer.transfer_id.clone(),
+            from_device_id: "pc-c".into(),
+            name: "hostile.txt".into(),
+            size: 4,
+            sha256: "x".into(),
+            mime: None,
+        };
+
+        let replies = mgr.handle_offer(duplicate, "pc-c");
+
+        assert!(
+            matches!(replies.first(), Some(Message::FileTransferReject { .. })),
+            "a reused active transfer id must be rejected: {replies:?}"
+        );
+        let record = mgr
+            .history()
+            .iter()
+            .rev()
+            .find(|entry| entry.transfer_id == offer.transfer_id)
+            .expect("the original transfer must stay in history");
+        assert_eq!(record.direction, TransferDirection::Outgoing);
+        assert_eq!(record.peer_device_id, "pc-b");
+        assert_eq!(record.state, TransferState::Offered);
+    }
+
+    #[test]
+    fn fail_peer_transfers_is_scoped_to_that_peer() {
+        let dir = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("from-b", 4, "x"), "pc-b");
+        mgr.handle_offer(offer_with_id("from-c", 4, "x"), "pc-c");
+        mgr.accept("from-b").unwrap();
+        mgr.accept("from-c").unwrap();
+
+        let failed = mgr.fail_peer_transfers("pc-b");
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].transfer_id, "from-b");
+        assert_eq!(failed[0].state, TransferState::Cancelled);
+        assert!(!dir.path().join("note.txt.from-b.part").exists());
+        assert!(mgr.owns_incoming("from-c", "pc-c"));
+        assert!(dir.path().join("note.txt.from-c.part").exists());
+    }
+
+    #[test]
+    fn duplicate_identical_chunk_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let mut mgr = FileTransferManager::new(
+            "pc-a",
+            FileTransferSettings {
+                auto_accept: false,
+                save_dir: dir.path().to_string_lossy().to_string(),
+                max_transfer_bytes: 1024,
+            },
+        );
+        mgr.handle_offer(offer_with_id("dup-chunk", 8, "x"), "pc-b");
+        mgr.accept("dup-chunk").unwrap();
+        let chunk = mymouse_protocol::FileChunk {
+            transfer_id: "dup-chunk".into(),
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+            last: false,
+        };
+        mgr.handle_chunk(chunk.clone()).unwrap();
+
+        let duplicate = mgr
+            .handle_chunk(chunk)
+            .expect("an identical resend must not fail the transfer")
+            .expect("an idempotent resend must still emit a record");
+        assert_eq!(duplicate.bytes_transferred, 4);
+        assert_eq!(duplicate.state, TransferState::InProgress);
+
+        let conflicting = mymouse_protocol::FileChunk {
+            transfer_id: "dup-chunk".into(),
+            offset: 0,
+            data: vec![9, 9, 9, 9],
+            last: false,
+        };
+        assert!(mgr.handle_chunk(conflicting).is_err());
     }
 }

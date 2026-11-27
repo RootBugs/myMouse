@@ -147,8 +147,8 @@ Add tests:
 
 - [ ] **Step 2: Run focused red tests**
 
-Run: `cargo test --manifest-path backend/Cargo.toml duplicate_offer_id_is_rejected -- --exact`
-Expected: FAIL.
+Run: `cargo test --manifest-path backend/Cargo.toml file_transfer::tests::duplicate_offer_id_is_rejected -- --exact`
+Expected: FAIL (`--exact` needs the fully qualified Rust test path).
 
 - [ ] **Step 3: Implement transfer state fixes**
 
