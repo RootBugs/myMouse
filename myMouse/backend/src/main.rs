@@ -683,11 +683,19 @@ async fn handle_request(
         }
         "offerFile" => {
             let path = params.get("path").and_then(Value::as_str).unwrap_or("");
-            let peer = params.get("peerDeviceId").and_then(Value::as_str).unwrap_or("peer");
+            let peer = params
+                .get("peerDeviceId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| network.active_peer_id().lock().unwrap().clone());
+            let peer = match peer {
+                Some(peer) if !peer.is_empty() => peer,
+                _ => return rpc_err(id, "no connected peer"),
+            };
             let offer = {
                 let mut st = state.lock().unwrap();
                 st.transfers
-                    .create_offer(std::path::Path::new(path), peer)
+                    .create_offer(std::path::Path::new(path), &peer)
                     .map(|(offer, _)| offer)
             };
             match offer {
@@ -1044,6 +1052,55 @@ mod tests {
             released.load(std::sync::atomic::Ordering::SeqCst),
             "every shutdown path must run input cleanup before stopping the runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn production_offer_file_defaults_to_the_active_peer() {
+        // Regression: the UI calls offerFile(path) with no peer id. The
+        // production handler defaulted the history record to the placeholder
+        // "peer" while the frame was routed to the active peer, so the
+        // accept-side peer check failed every normal UI file transfer.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("offer.bin");
+        std::fs::write(&source, vec![1u8; 32]).unwrap();
+
+        let state = Arc::new(Mutex::new(AppState::new(dir.path().to_path_buf()).unwrap()));
+        let device_id = state.lock().unwrap().device_id.clone();
+        let network = network::start(
+            state.clone(),
+            device_id,
+            String::new(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        );
+        *network.active_peer_id().lock().unwrap() = Some("pc-b".to_string());
+
+        handle_request(
+            &state,
+            &network,
+            1,
+            &json!({
+                "method": "offerFile",
+                "params": { "path": source.to_string_lossy() }
+            }),
+        )
+        .await;
+
+        let record = {
+            let st = state.lock().unwrap();
+            st.transfers
+                .history()
+                .into_iter()
+                .find(|entry| entry.name == "offer.bin")
+                .cloned()
+                .expect("offer must be recorded in history")
+        };
+        assert_eq!(
+            record.peer_device_id, "pc-b",
+            "a UI offer without a peer id must target the connected peer, not a placeholder"
+        );
+
+        shutdown_runtime(&network, || {});
     }
 
     #[test]

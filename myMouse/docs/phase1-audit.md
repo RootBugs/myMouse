@@ -113,6 +113,14 @@ unit-tested and wired**; both **not physically tested**.
   now update `TransferState::Failed` in history, so `listTransfers` agrees with
   `transferUpdate`. Both regressions are unit-tested; terminal history is not
   overwritten by late notices.
+- A follow-up fresh review found that production `offerFile` still labelled the
+  UI's no-peer-id offer with the placeholder `"peer"` while routing the frame
+  to the active peer. The accept-side peer check therefore failed every normal
+  UI file transfer. Production now resolves the omitted peer from the runtime's
+  active peer before creating the offer, and
+  `production_offer_file_defaults_to_the_active_peer` is a red→green regression
+  test. With no active peer, the RPC returns `no connected peer` instead of
+  recording a placeholder offer.
 - Windows `SendInput` release effects and a physical silent-peer/held-key
   interruption were **not** hardware-audited. No superiority or field-latency
   claim follows from this increment.
@@ -141,7 +149,7 @@ Commands were run from `myMouse/` unless noted.
 
 | Command | Result |
 | --- | --- |
-| `cargo test` in `myMouse/backend` | `80 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
+| `cargo test` in `myMouse/backend` | `81 passed; 0 failed` unit tests; `1 passed; 0 failed` for each of the two integration test binaries |
 | `cargo test` in `myMouse/shared/protocol` | `9 passed; 0 failed` |
 | `npm test -- --run` | `5 files / 19 tests passed`, exit 0 (non-fatal Vite CJS Node API deprecation warning) |
 | `npm run build` | exit 0; Vite produced `index.html`, CSS, and JS assets; Electron TypeScript build succeeded |
