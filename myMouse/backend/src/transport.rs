@@ -25,7 +25,7 @@ pub type TransportResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>
 /// the listener accepts only peers whose identity was explicitly pinned.
 pub type ClientPinMap = Arc<RwLock<std::collections::HashMap<String, String>>>;
 
-const MAX_FRAME_LEN: usize = 1024 * 1024;
+const MAX_FRAME_LEN: usize = mymouse_protocol::MAX_ENCODED_FRAME_LEN;
 
 fn fingerprint(cert: &[u8]) -> String {
     Sha256::digest(cert)

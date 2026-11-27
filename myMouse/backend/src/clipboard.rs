@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_CLIPBOARD_BYTES: usize = 512 * 1024;
+/// Raw image bytes are capped well below the transport frame so base64 plus
+/// device and MIME fields cannot overflow a single encoded frame.
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 640 * 1024;
+const MAX_PROTOCOL_FRAME_BYTES: usize = mymouse_protocol::MAX_ENCODED_FRAME_LEN;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +78,29 @@ fn fingerprint(snapshot: &ClipboardSnapshot) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn clipboard_payload_allowed(payload: &ClipboardPayload) -> bool {
+    if payload
+        .text
+        .as_ref()
+        .is_some_and(|text| text.len() > MAX_CLIPBOARD_BYTES)
+    {
+        return false;
+    }
+    if let Some(data) = &payload.data_base64 {
+        if data.len() > MAX_CLIPBOARD_BYTES * 2 {
+            return false;
+        }
+        let Some(bytes) = ClipboardManager::decode_image(data) else {
+            return false;
+        };
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            return false;
+        }
+    }
+    let frame = Message::ClipboardUpdate(payload.clone());
+    mymouse_protocol::encode(&frame).len() <= MAX_PROTOCOL_FRAME_BYTES
+}
+
 impl ClipboardManager {
     pub fn new(device_id: impl Into<String>, settings: ClipboardSettings) -> Self {
         Self {
@@ -99,6 +126,28 @@ impl ClipboardManager {
             return None;
         }
         let fp = fingerprint(&snapshot);
+        let ClipboardSnapshot {
+            kind,
+            text,
+            data_base64,
+            mime,
+        } = snapshot;
+        let seq = self.local_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let timestamp_ms = now_ms();
+        let payload = ClipboardPayload {
+            device_id: self.device_id.clone(),
+            kind,
+            text,
+            data_base64,
+            mime,
+            timestamp_ms,
+            seq,
+        };
+        // Validate before recording the fingerprint, so an oversized update
+        // cannot poison deduplication for a later valid update.
+        if !clipboard_payload_allowed(&payload) {
+            return None;
+        }
         {
             let mut last = self.last_fingerprint.lock().unwrap();
             if last.as_deref() == Some(&fp) {
@@ -106,56 +155,30 @@ impl ClipboardManager {
             }
             *last = Some(fp);
         }
-
-        let text = snapshot.text;
-        let data_base64 = snapshot.data_base64;
-        if let Some(t) = &text {
-            if t.len() > MAX_CLIPBOARD_BYTES {
-                return None;
-            }
-        }
-        if let Some(d) = &data_base64 {
-            if d.len() > MAX_CLIPBOARD_BYTES * 2 {
-                return None;
-            }
-        }
-
-        let seq = self.local_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let timestamp_ms = now_ms();
         self.last_timestamp_ms.store(timestamp_ms, Ordering::SeqCst);
         self.last_seq.store(seq, Ordering::SeqCst);
 
-        Some(Message::ClipboardUpdate(ClipboardPayload {
-            device_id: self.device_id.clone(),
-            kind: snapshot.kind,
-            text,
-            data_base64,
-            mime: snapshot.mime,
-            timestamp_ms,
-            seq,
-        }))
+        Some(Message::ClipboardUpdate(payload))
     }
 
     /// Apply a remote clipboard update if it wins last-write-wins arbitration.
     /// Returns a snapshot to write to the OS clipboard when accepted.
-    pub fn accept_remote(&self, payload: &ClipboardPayload) -> Option<ClipboardSnapshot> {
+    pub fn accept_remote(
+        &self,
+        payload: &ClipboardPayload,
+        source_device_id: &str,
+    ) -> Option<ClipboardSnapshot> {
         if !self.settings.enabled {
             return None;
         }
-        if payload.device_id == self.device_id {
+        // The frame authenticated `source_device_id`; the payload's own ID is
+        // untrusted and must agree before any clipboard state is changed.
+        if source_device_id == self.device_id || payload.device_id != source_device_id {
             return None;
         }
         // Inbound data must obey the same policy as outbound data. A peer
         // also must not pin arbitration forever with a far-future timestamp.
-        if payload
-            .text
-            .as_ref()
-            .is_some_and(|text| text.len() > MAX_CLIPBOARD_BYTES)
-            || payload
-                .data_base64
-                .as_ref()
-                .is_some_and(|data| data.len() > MAX_CLIPBOARD_BYTES * 2)
-        {
+        if !clipboard_payload_allowed(payload) {
             return None;
         }
         if payload.timestamp_ms > now_ms().saturating_add(300_000) {
@@ -168,7 +191,9 @@ impl ClipboardManager {
         let current_seq = self.last_seq.load(Ordering::SeqCst);
         let wins = incoming_ts > current_ts
             || (incoming_ts == current_ts && incoming_seq > current_seq)
-            || (incoming_ts == current_ts && incoming_seq == current_seq && payload.device_id > self.device_id);
+            || (incoming_ts == current_ts
+                && incoming_seq == current_seq
+                && source_device_id > self.device_id.as_str());
         if !wins {
             return None;
         }
@@ -387,7 +412,7 @@ mod tests {
             timestamp_ms: now_ms() + 10_000,
             seq: 1,
         };
-        let accepted = mgr.accept_remote(&remote).expect("newer remote should win");
+        let accepted = mgr.accept_remote(&remote, "pc-b").expect("newer remote should win");
         assert_eq!(accepted.text.as_deref(), Some("new"));
     }
 
@@ -404,7 +429,7 @@ mod tests {
             timestamp_ms: 1,
             seq: 1,
         };
-        assert!(mgr.accept_remote(&remote).is_none());
+        assert!(mgr.accept_remote(&remote, "pc-b").is_none());
     }
 
     #[test]
@@ -425,7 +450,7 @@ mod tests {
             timestamp_ms: u64::MAX,
             seq: 1,
         };
-        assert!(mgr.accept_remote(&remote).is_none());
+        assert!(mgr.accept_remote(&remote, "pc-b").is_none());
     }
 
     #[test]
@@ -440,6 +465,60 @@ mod tests {
             timestamp_ms: now_ms() + 86_400_000,
             seq: 1,
         };
-        assert!(mgr.accept_remote(&remote).is_none());
+        assert!(mgr.accept_remote(&remote, "pc-b").is_none());
+    }
+
+    #[test]
+    fn remote_clipboard_requires_authenticated_device_id() {
+        let mgr = ClipboardManager::new("pc-a", ClipboardSettings::default());
+        let remote = ClipboardPayload {
+            device_id: "pc-c".into(),
+            kind: ClipboardKind::Text,
+            text: Some("spoofed".into()),
+            data_base64: None,
+            mime: Some("text/plain".into()),
+            timestamp_ms: now_ms() + 10_000,
+            seq: 1,
+        };
+        assert!(
+            mgr.accept_remote(&remote, "pc-b").is_none(),
+            "a self-asserted device ID must not override the authenticated peer"
+        );
+        assert!(
+            mgr.accept_remote(&remote, "pc-c").is_some(),
+            "the authenticated peer's own payload must still be accepted"
+        );
+    }
+
+    #[test]
+    fn image_payload_fits_transport_frame() {
+        let mgr = ClipboardManager::new("pc-a", ClipboardSettings::default());
+        let max_image = vec![0xA5u8; MAX_CLIPBOARD_IMAGE_BYTES];
+        let snapshot = ClipboardSnapshot {
+            kind: ClipboardKind::Image,
+            text: None,
+            data_base64: Some(ClipboardManager::encode_image(&max_image)),
+            mime: Some("image/png".into()),
+        };
+        let message = mgr
+            .build_update(snapshot)
+            .expect("the maximum allowed image must be accepted");
+        let frame_len = mymouse_protocol::encode(&message).len();
+        assert!(
+            frame_len <= MAX_PROTOCOL_FRAME_BYTES,
+            "encoded clipboard frame {frame_len} exceeds {MAX_PROTOCOL_FRAME_BYTES}"
+        );
+
+        let over_image = vec![0x5Au8; MAX_CLIPBOARD_IMAGE_BYTES + 1];
+        let over_snapshot = ClipboardSnapshot {
+            kind: ClipboardKind::Image,
+            text: None,
+            data_base64: Some(ClipboardManager::encode_image(&over_image)),
+            mime: Some("image/png".into()),
+        };
+        assert!(
+            mgr.build_update(over_snapshot).is_none(),
+            "an image above the bound must be rejected before it can break the frame cap"
+        );
     }
 }

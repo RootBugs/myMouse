@@ -4,7 +4,10 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const PROTOCOL_HEADER_LEN: usize = 2;
-const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
+/// Encoded-frame cap shared with the transport. The transport length prefix is
+/// separate from these bytes, so both layers use the same encoded payload cap.
+pub const MAX_ENCODED_FRAME_LEN: usize = 1024 * 1024;
+const MAX_BODY_LEN: usize = MAX_ENCODED_FRAME_LEN - PROTOCOL_HEADER_LEN;
 
 pub type DeviceId = String;
 pub type TransferId = String;
@@ -24,7 +27,7 @@ impl fmt::Display for ProtocolError {
         let text = match self {
             ProtocolError::TooShort => "message shorter than protocol header",
             ProtocolError::VersionMismatch => "unsupported protocol version",
-            ProtocolError::TooLarge => "message body exceeds 16 MiB",
+            ProtocolError::TooLarge => "message frame exceeds 1 MiB",
             ProtocolError::InvalidPayload => "invalid message payload",
         };
         f.write_str(text)
@@ -138,6 +141,21 @@ pub enum Message {
     },
 }
 
+/// Kotlin mirrors these fields as signed `Long`. Values above `i64::MAX`
+/// decode in Rust but wrap in the Android client, so the wire format rejects
+/// them at decode time instead of letting peers disagree.
+fn has_unsigned_value_above_i64_max(message: &Message) -> bool {
+    const LIMIT: u64 = i64::MAX as u64;
+    match message {
+        Message::ClipboardUpdate(payload) => {
+            payload.timestamp_ms > LIMIT || payload.seq > LIMIT
+        }
+        Message::FileTransferOffer(offer) => offer.size > LIMIT,
+        Message::FileTransferChunk(chunk) => chunk.offset > LIMIT,
+        _ => false,
+    }
+}
+
 pub fn encode(message: &Message) -> Vec<u8> {
     let body = bincode::serialize(message).expect("Message serialization cannot fail");
     let mut bytes = Vec::with_capacity(PROTOCOL_HEADER_LEN + body.len());
@@ -161,14 +179,23 @@ pub fn decode(bytes: &[u8]) -> ProtocolResult<Message> {
     // Bound bincode's internal allocations by the bytes actually received.
     // bincode 1.3's slice `deserialize` discards `with_limit`, so decode from
     // a Cursor instead; that path honours the configured byte budget.
+    let mut cursor = std::io::Cursor::new(body);
     let message: Message = bincode::options()
         .with_fixint_encoding()
         .with_limit(body.len() as u64)
-        .deserialize_from(std::io::Cursor::new(body))
+        .deserialize_from(&mut cursor)
         .map_err(|error| match *error {
             bincode::ErrorKind::SizeLimit => ProtocolError::TooLarge,
             _ => ProtocolError::InvalidPayload,
         })?;
+    // A frame is one message. Rejecting trailing bytes prevents peer-dependent
+    // interpretation of the same authenticated frame.
+    if cursor.position() as usize != body.len() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    if has_unsigned_value_above_i64_max(&message) {
+        return Err(ProtocolError::InvalidPayload);
+    }
     if let Message::Hello { version, .. } = &message {
         if *version != PROTOCOL_VERSION {
             return Err(ProtocolError::VersionMismatch);
@@ -207,6 +234,67 @@ mod tests {
         let prefix_at = PROTOCOL_HEADER_LEN + 4;
         bytes[prefix_at..prefix_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(decode(&bytes), Err(ProtocolError::TooLarge));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let mut bytes = encode(&Message::Hello {
+            version: PROTOCOL_VERSION,
+            device_id: "pc-a".into(),
+            name: "A".into(),
+        });
+        bytes.extend_from_slice(&[0u8, 0u8]);
+        assert_eq!(decode(&bytes), Err(ProtocolError::InvalidPayload));
+    }
+
+    #[test]
+    fn decode_rejects_unsigned_values_above_i64_max() {
+        let above = i64::MAX as u64 + 1;
+        let clipboard_timestamp = Message::ClipboardUpdate(ClipboardPayload {
+            device_id: "pc-a".into(),
+            kind: ClipboardKind::Text,
+            text: Some("x".into()),
+            data_base64: None,
+            mime: None,
+            timestamp_ms: above,
+            seq: 1,
+        });
+        assert_eq!(
+            decode(&encode(&clipboard_timestamp)),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let clipboard_seq = Message::ClipboardUpdate(ClipboardPayload {
+            device_id: "pc-a".into(),
+            kind: ClipboardKind::Text,
+            text: Some("x".into()),
+            data_base64: None,
+            mime: None,
+            timestamp_ms: 1,
+            seq: above,
+        });
+        assert_eq!(
+            decode(&encode(&clipboard_seq)),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let offer = Message::FileTransferOffer(FileOffer {
+            transfer_id: "t".into(),
+            from_device_id: "pc-a".into(),
+            name: "big.bin".into(),
+            size: above,
+            sha256: "x".into(),
+            mime: None,
+        });
+        assert_eq!(decode(&encode(&offer)), Err(ProtocolError::InvalidPayload));
+
+        let chunk = Message::FileTransferChunk(FileChunk {
+            transfer_id: "t".into(),
+            offset: above,
+            data: vec![0; 1],
+            last: true,
+        });
+        assert_eq!(decode(&encode(&chunk)), Err(ProtocolError::InvalidPayload));
     }
 
     #[test]

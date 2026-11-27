@@ -1000,11 +1000,14 @@ impl PeerRuntime {
             ));
             return;
         }
+        let source_device_id = frame.peer_device_id.clone();
         match frame.message {
             Message::ClipboardUpdate(payload) => {
                 let snapshot = {
                     let state = self.state.lock().unwrap();
-                    state.clipboard.accept_remote(&payload)
+                    state
+                        .clipboard
+                        .accept_remote(&payload, &source_device_id)
                 };
                 if let Some(snapshot) = &snapshot {
                     if self.os_integration {
@@ -1017,7 +1020,7 @@ impl PeerRuntime {
                 };
                 emit(json!({
                     "notification": "clipboardUpdate",
-                    "deviceId": payload.device_id,
+                    "deviceId": source_device_id,
                     "kind": kind,
                     "text": payload.text,
                     "dataBase64": payload.data_base64,

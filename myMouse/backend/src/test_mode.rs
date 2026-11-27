@@ -16,7 +16,7 @@ use crate::{
     config_dir, AppState,
 };
 use crate::trust::Capabilities;
-use mymouse_protocol::Message;
+use mymouse_protocol::{Message, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io::{self, Write};
@@ -199,17 +199,38 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
     }));
 
     let accept_network = network.clone();
-    let accept_peer_id = peer_id.clone();
+    let accept_state = state.clone();
     tokio::spawn(async move {
         loop {
             match server.accept().await {
-                Ok(stream) => {
+                Ok(mut stream) => {
                     emit(json!({ "notification": "peer-stream" }));
-                    if accept_network
-                        .attach_inbound(stream, accept_peer_id.clone())
+                    // Test mode uses a fixed test certificate, so it does not
+                    // repeat the production trust gate. It still reads the
+                    // Hello, however, so the runtime labels the connection
+                    // with the peer's real announced ID instead of the local
+                    // static configuration.
+                    let hello = tokio::time::timeout(Duration::from_secs(5), stream.recv())
                         .await
-                        .is_err()
+                        .ok()
+                        .and_then(|result| result.ok());
+                    let Some(Message::Hello {
+                        version: PROTOCOL_VERSION,
+                        device_id: peer_id,
+                        ..
+                    }) = hello
+                    else {
+                        emit(json!({
+                            "notification": "inboundRejected",
+                            "reason": "missing test Hello"
+                        }));
+                        continue;
+                    };
                     {
+                        let mut st = accept_state.lock().unwrap();
+                        st.trust.grant(&peer_id, Capabilities::default());
+                    }
+                    if accept_network.attach_inbound(stream, peer_id).await.is_err() {
                         break;
                     }
                 }
@@ -229,6 +250,20 @@ pub async fn run(config: TestConfig) -> Result<(), Box<dyn Error + Send + Sync>>
                         .await
                     {
                         Ok(()) => {
+                            // Mirror the production connect handshake so the
+                            // listener can bind this connection to our real
+                            // device ID.
+                            if let Err(error) = network
+                                .send(Message::Hello {
+                                    version: PROTOCOL_VERSION,
+                                    device_id: device_id.clone(),
+                                    name: device_id.clone(),
+                                })
+                                .await
+                            {
+                                last_error = error;
+                                continue;
+                            }
                             connected = true;
                             break;
                         }
